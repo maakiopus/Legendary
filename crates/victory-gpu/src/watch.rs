@@ -3011,6 +3011,11 @@ fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
+    // Pages the runtime shows by `mremap` under Wine are private memory to
+    // Windows' eye; the runtime told of them.
+    if crate::inplace::shows_any(start, end) {
+        return true;
+    }
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;

@@ -450,6 +450,24 @@ impl Section {
 }
 
 impl Section {
+    /// Under Wine with [`direct`] on: where in the section's whole view
+    /// ([`Section::window`]) the `n` pages from `index` on are, to be shown
+    /// elsewhere by `mremap`; `None` when views are mapped as on Windows.
+    fn direct_from(&self, index: usize, n: usize) -> Option<usize> {
+        if !direct::on() {
+            return None;
+        }
+        self.window(index, n)
+    }
+
+    /// Whether this section's pages are shown by [`direct`] (then a page
+    /// mapping is a committed reservation of ours, freed, not unmapped).
+    fn is_direct(&self) -> bool {
+        direct::on() && self.window.get().is_some_and(|&base| base != 0)
+    }
+}
+
+impl Section {
     /// Commits the pages from `index` on that a view at `base` shows, unless
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
@@ -1606,24 +1624,19 @@ struct Op {
     had: bool,
     /// The placeholder is the page's own (or will be, after the unmapping).
     own: bool,
+    /// The view there is a reservation of [`show_direct`].
+    had_direct: bool,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false }
+        Op { at, slice, had: false, own: false, had_direct: false }
     }
 
     /// The system calls; whether the host did as asked.
     fn run(&self) -> bool {
         if self.had {
-            // SAFETY: a view we mapped; it becomes a placeholder again.
-            let gone = counted(Call::Unmap, || unsafe {
-                UnmapViewOfFile2(
-                    GetCurrentProcess(),
-                    MEMORY_MAPPED_VIEW_ADDRESS { Value: self.at as *mut c_void },
-                    MEM_PRESERVE_PLACEHOLDER,
-                )
-            });
+            let gone = unshow(self.at, PAGE, self.had_direct);
             if gone == 0 {
                 return false;
             }
@@ -1651,6 +1664,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             Some((base, PAGE)) if base == op.at => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
+                    op.had_direct = slice.section.is_direct();
                 }
                 victory_gpu::title_memory_unmapping(op.at, PAGE);
                 physical.holes.remove(&op.at);
@@ -1807,7 +1821,7 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own, had_direct: op.had_direct };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
@@ -1846,9 +1860,166 @@ fn split(base: usize, len: usize) {
     });
 }
 
+/// Page mappings under Wine without the wineserver. A view of a section is a
+/// wineserver request to map and one to unmap, and each looks through every
+/// view the process has: in the title's world about 130,000, 0.65 ms a
+/// request, 4.3 s of every 5 s spent in them by the thread that maps, with
+/// sixteen DirectStorage workers waiting behind it. Here the address gets a
+/// committed reservation of its own in place of the placeholder, which Wine
+/// makes without asking the server, and the section's pages are shown there
+/// by `mremap` from the section's whole view ([`Section::window`]), through a
+/// small unix library of ours (`unix/victory_pages.rs`) beside the program:
+/// 8.5 us for the two. Without that library, or with
+/// `VICTORY_DIRECT_PAGES=0`, pages are views as on Windows.
+mod direct {
+    use std::ffi::c_void;
+    use std::sync::LazyLock;
+
+    #[repr(C)]
+    struct Show {
+        from: usize,
+        bytes: usize,
+        at: usize,
+        result: isize,
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum: u16,
+        buffer: *const u16,
+    }
+
+    type Query = unsafe extern "system" fn(isize, *const c_void, i32, *mut c_void, usize, *mut usize) -> i32;
+    type Call = unsafe extern "system" fn(u64, u32, *mut c_void) -> i32;
+    /// `MemoryWineLoadUnixLibByName` (Wine 11).
+    const LOAD_BY_NAME: i32 = 1002;
+
+    static LIBRARY: LazyLock<Option<(u64, Call)>> = LazyLock::new(|| {
+        let library = load();
+        tracing::info!(loaded = library.is_some(), "pages mapped without the wineserver");
+        library
+    });
+
+    fn load() -> Option<(u64, Call)> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        if !super::on_wine() || std::env::var_os("VICTORY_DIRECT_PAGES").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let path = std::env::current_exe().ok()?.with_file_name("victory_pages.so");
+        if !path.is_file() {
+            return None;
+        }
+        let name: Vec<u16> = r"\??\".encode_utf16().chain(path.as_os_str().encode_wide()).collect();
+        let length = u16::try_from(name.len() * 2).ok()?;
+        let name = UnicodeString { length, maximum: length, buffer: name.as_ptr() };
+        // SAFETY: ntdll's exports by their own signatures; Wine's query takes
+        // the library's NT path and gives the module and the call handle.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            let query: Query = std::mem::transmute(GetProcAddress(ntdll, c"NtQueryVirtualMemory".as_ptr().cast())?);
+            let call = GetProcAddress(ntdll, c"__wine_unix_call_dispatcher".as_ptr().cast())? as *const *const c_void;
+            if (*call).is_null() {
+                return None;
+            }
+            let call: Call = std::mem::transmute(*call);
+            let mut out = [0u64; 2];
+            let status = query(
+                -1,
+                (&raw const name).cast(),
+                LOAD_BY_NAME,
+                out.as_mut_ptr().cast(),
+                size_of_val(&out),
+                std::ptr::null_mut(),
+            );
+            if status != 0 || out[1] == 0 {
+                tracing::warn!(status = format_args!("{status:#x}"), "victory_pages.so not loaded");
+                return None;
+            }
+            Some((out[1], call))
+        }
+    }
+
+    pub(super) fn on() -> bool {
+        LIBRARY.is_some()
+    }
+
+    /// Shows the shared pages mapped at `from` at `at` as well.
+    pub(super) fn show(from: usize, at: usize, bytes: usize) -> bool {
+        let Some((library, call)) = *LIBRARY else { return false };
+        let mut args = Show { from, bytes, at, result: 0 };
+        // SAFETY: the library's only call; `at` is the caller's reservation.
+        let status = unsafe { call(library, 0, (&raw mut args).cast()) };
+        status == 0 && args.result == at as isize
+    }
+}
+
+/// [`show`] by [`direct`]: a committed reservation in place of the
+/// placeholder (no wineserver request), then the section's pages at `from`
+/// moved over it.
+fn show_direct(base: usize, len: usize, from: usize, own: bool) -> bool {
+    let reserve = || {
+        // SAFETY: replaces a placeholder of exactly `len` bytes at `base`;
+        // acts only on one.
+        counted(Call::Map, || unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base as *const c_void,
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }) as usize
+    };
+    let mut at = if own { reserve() } else { 0 };
+    if at != base {
+        split(base, len);
+        at = reserve();
+    }
+    if at != base {
+        tracing::warn!(
+            address = format_args!("{base:#x}"),
+            len,
+            error = %std::io::Error::last_os_error(),
+            "mapping physical pages failed (not a placeholder?)"
+        );
+        return false;
+    }
+    if !direct::show(from, base, len) {
+        tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages not shown by mremap");
+        // SAFETY: the reservation just made, back to a placeholder.
+        unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        return false;
+    }
+    true
+}
+
+/// Returns the mapping at `at` of `len` bytes to a placeholder: a view is
+/// unmapped, a reservation of [`show_direct`] freed. Nonzero if done.
+fn unshow(at: usize, len: usize, direct: bool) -> i32 {
+    // SAFETY: a mapping we made; it becomes a placeholder again.
+    counted(Call::Unmap, || unsafe {
+        if direct {
+            VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+        } else {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        }
+    })
+}
+
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    if let Some(from) = slice.section.direct_from(slice.index, len / PAGE) {
+        return show_direct(base, len, from, own);
+    }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
@@ -1980,16 +2151,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             victory_gpu::title_memory_splitting(at, size);
         }
         victory_gpu::title_memory_unmapping(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        let gone = counted(Call::Unmap, || unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        });
+        let gone = unshow(at, size, slice.section.is_direct());
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }

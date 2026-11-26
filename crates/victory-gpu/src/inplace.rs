@@ -569,6 +569,14 @@ fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usiz
     Some((start, stop - start, section, (start as i128 - delta) as u64))
 }
 
+/// Whether any view the runtime told of touches `[start, end)`. Under Wine
+/// the runtime shows section pages by `mremap` into reservations of its own
+/// (`xmem`'s `direct`), which Windows' questions answer as private memory.
+pub(crate) fn shows_any(start: usize, end: usize) -> bool {
+    let v = views();
+    v.views.range(..end).next_back().is_some_and(|(&base, view)| base + view.0 > start)
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.
@@ -652,6 +660,8 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && info.Type == mem::MEM_PRIVATE
         && info.Protect == mem::PAGE_READWRITE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+        // Not pages the runtime shows there (private to the host's eye).
+        && !shows_any(at, at.saturating_add(len))
 }
 
 fn hr<T>(result: &windows::core::Result<T>) -> String {
