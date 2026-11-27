@@ -1,5 +1,10 @@
 # Legendary (Linux Victory Port)
 
+> **Reference only — not canonical for Belobug.**  
+> **Source:** Legendary Linux/Proton port.  
+> **Context:** Source for the later Linux port now present in Belobug; current Belobug docs are canonical.  
+> **Canonical Belobug notes:** `~/clone/victors/VIctory-Belobug-AMD/docs/rx6700xt-linux-porting.md`.
+
 **The Linux/Proton port of VIctory**: a compatibility layer that runs an Xbox
 Series title natively from files you supply, here carried under Wine/Proton with
 vkd3d-proton on AMD (RADV) — and still building and running on Windows.
