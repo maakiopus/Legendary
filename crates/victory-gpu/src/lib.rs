@@ -54,6 +54,8 @@ mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+pub use port::{port_private, port_private_gone};
+#[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
 pub mod port_descriptors;
