@@ -1517,7 +1517,18 @@ fn wide_threads() -> usize {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|&n: &usize| (1..=16).contains(&n))
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 8))
+            .unwrap_or_else(|| {
+                // A third only while the absent regions are remembered: with
+                // the cache off (the default) every thread queues at Wine's
+                // process-wide lock on each VirtualQuery, and a quarter (2
+                // to 6) is the count measured for that.
+                let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+                if crate::watch::absent_cache() {
+                    (cpus / 3).clamp(2, 8)
+                } else {
+                    (cpus / 4).clamp(2, 6)
+                }
+            })
     })
 }
 
@@ -4397,8 +4408,12 @@ impl Shadow {
         }
         SCRATCH.with(|s| {
             let mut title = s.borrow_mut();
-            title.clear();
-            title.resize(to - from, 0);
+            // Keep the buffer's length: every byte is overwritten below, and
+            // clearing it first was a full memset of up to 100+ MB a frame.
+            if title.len() < to - from {
+                title.resize(to - from, 0);
+            }
+            let title = &mut title[..to - from];
             crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
             // SAFETY: inside the mapping (`from` and `to` are within the buffer).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
