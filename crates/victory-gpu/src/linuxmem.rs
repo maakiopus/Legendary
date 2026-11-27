@@ -328,6 +328,13 @@ fn state() -> &'static State {
                 (true, false, Ok(_)) => tracing::warn!("{name}=1 but falling back to {win32}: this kernel cannot ({caps:?})"),
             }
         }
+        // (The thread times are on because the library is, not because the
+        // switch was set: say so, with the way off.)
+        if can[5] && wanted[5] && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err() {
+            tracing::info!(
+                "VICTORY_NATIVE_THREAD_TIMES: on because victory_mem.so is loaded (set it to 0 for GetThreadTimes)"
+            );
+        }
         State {
             direct_pages: wanted[0] && can[0],
             native_scan: wanted[1] && can[1],
