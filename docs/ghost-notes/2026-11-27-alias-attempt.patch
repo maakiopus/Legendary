@@ -1,0 +1,433 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 23bd2f9..f5b46fd 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -4524,6 +4524,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
+             let aliased = crate::resource::alias_of(*resource as This)
+                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+             if !aliased
++                // The memory this view lies in was written on the host: title
++                // memory there is what it was before, and filling the host
++                // copy from it puts stale texels back over the fresh ones an
++                // alias copy may have made. Leave it until the copy can be.
++                && !crate::resource::host_written_here(*resource as This)
+                 && let Some(t) = crate::resource::host_copy(*resource as This)
+                 && t.flags() & 0x7 == 0
+             {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index e784ad0..3adcee0 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -1523,7 +1523,31 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
+             && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+             && d.sample_count <= 1
+     };
+-    if !r.host.placed.load(Relaxed) || !fills(&r.desc) || !one(&r.desc) {
++    let why = |reason: &'static str| {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_WHY").is_some_and(|v| v != "0")) {
++            return;
++        }
++        static SAID: std::sync::Mutex<std::collections::BTreeSet<(usize, &'static str)>> =
++            std::sync::Mutex::new(std::collections::BTreeSet::new());
++        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
++        if said.len() < 400 && said.insert((this as usize, reason)) {
++            tracing::info!(
++                view = ?this,
++                reason,
++                address = format_args!("{:#x}", r.data() as u64),
++                width = r.desc.width,
++                height = r.desc.height,
++                mip_levels = r.desc.mip_levels,
++                layers = r.desc.depth_or_array_size,
++                format = r.desc.format,
++                flags = r.desc.flags,
++                "a placed texture is not read from a host-written texture"
++            );
++        }
++    };
++    if !r.host.placed.load(Relaxed) || !one(&r.desc) {
++        why("not a placed texture of one shape");
+         return None;
+     }
+     // Under the table's lock: a texture leaves it before it is freed.
+@@ -1536,9 +1560,32 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
+     // title memory, which this view's host copy is filled from, may not
+     // (a bake's atlas is copied into in tiles, and a placed view of it was
+     // filled from the memory those tiles never reached).
+-    let other = target
+-        .map(|at| at as This)
+-        .or_else(|| crate::texture::host_written_at(r.data() as u64))?;
++    let written = crate::texture::host_written_at(r.data() as u64).or_else(|| {
++        // A copy into a texture of the title's marks that texture, not the
++        // placed view the title later samples: the view carries only the
++        // console address. Its shape still names it when one copied texture
++        // has that shape.
++        // SAFETY: 56 bytes in the description's layout.
++        let words = unsafe { std::ptr::from_ref(&r.desc).cast::<[u32; 14]>().read_unaligned() };
++        crate::texture::host_written_like(&words)
++    });
++    // A view the title fills itself (a target, depth or unordered access
++    // texture) is read from title memory only while no host copy wrote it:
++    // once one did, that copy holds the texels, as it does for any other
++    // texture. The flags say what the title may do through the view, not
++    // where its contents are (the decoration bake's atlas is a placed view
++    // with 0x7 in its flags, and it kept being filled from title memory).
++    if !fills(&r.desc) && written.is_none() {
++        why("the title fills it and no host copy wrote it");
++        return None;
++    }
++    let other = match target.map(|at| at as This).or(written) {
++        Some(other) => other,
++        None => {
++            why("no target or host-written texture at its address");
++            return None;
++        }
++    };
+     let o = resource(other);
+     const DEPTH: u32 = 0x2;
+     let same = one(&o.desc)
+@@ -1577,6 +1624,23 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
+     same.then_some(other)
+ }
+ 
++/// Whether a host copy wrote the memory `this`'s placed texture lies in:
++/// title memory there is not what the title's views show.
++#[cfg(windows)]
++pub(crate) fn host_written_here(this: This) -> bool {
++    if this.is_null() {
++        return false;
++    }
++    let r = resource(this);
++    if crate::texture::host_written_at(r.data() as u64).is_some() {
++        return true;
++    }
++    // A view whose address the copy did not name: the shape may.
++    // SAFETY: 56 bytes in the description's layout.
++    let words = unsafe { std::ptr::from_ref(&r.desc).cast::<[u32; 14]>().read_unaligned() };
++    crate::texture::host_written_like(&words).is_some()
++}
++
+ /// Whether host copies are made on first use. On by default;
+ /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
+ /// as before.
+@@ -3204,6 +3268,22 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+         return None;
+     }
+     map.insert((address, *desc), out as usize);
++    if crate::texture::alias_why() {
++        use std::sync::atomic::{AtomicU64, Ordering};
++        static SAID: AtomicU64 = AtomicU64::new(0);
++        if SAID.fetch_add(1, Ordering::Relaxed) < 200 {
++            tracing::info!(
++                address = format_args!("{address:#x}"),
++                width = d.width,
++                height = d.height,
++                mip_levels = d.mip_levels,
++                layers = d.depth_or_array_size,
++                format = d.format,
++                layout = d.layout,
++                "placed texture made"
++            );
++        }
++    }
+     crate::texture::placed_in_host_written(address, desc);
+     resource(out)
+         .host
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 89b98b3..fcc7fbd 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -163,6 +163,9 @@ struct Through {
+         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+     )>,
++    /// [`written_epoch`] of the source when the copy was recorded into a
++    /// list: a later write to the source, on any list, asks for it again.
++    epoch: std::sync::atomic::AtomicU64,
+ }
+ 
+ /// The most levels times layers [`alias`] copies (a cube of nine levels).
+@@ -176,6 +179,22 @@ unsafe impl Sync for Through {}
+ /// The copy buffers of [`alias`], by the placed view's texture.
+ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+ 
++/// `VICTORY_ALIAS_WHY=1`: say why a view is not read from a host-written
++/// texture (the copy refused, or one of its parts did not line up).
++pub(crate) fn alias_why() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_WHY").is_some_and(|v| v != "0"))
++}
++
++/// Whether this is the first refusal for `key` (a placed view) to say.
++fn alias_once(key: usize) -> bool {
++    static SAID: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
++        std::sync::Mutex::new(None);
++    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
++    let said = said.get_or_insert_with(Default::default);
++    said.len() < 300 && said.insert(key)
++}
++
+ /// Brings `placed`, the texture of a view the title placed in the memory
+ /// of `source` in another format (`crate::resource::alias_of`), up to date
+ /// with what the host wrote to `source`: the texels of every level and
+@@ -218,6 +237,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+                 };
+                 let parts = count(&of_from);
+                 if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
++                    if alias_why() && alias_once(placed as usize) {
++                        tracing::info!(
++                            view = ?placed,
++                            texture = ?source,
++                            parts,
++                            other = count(&of_to),
++                            "an alias copy is not made: the two textures have a different number of parts"
++                        );
++                    }
+                     return false;
+                 }
+                 let mut rows = [(); 2]
+@@ -254,6 +282,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+                             == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
+                 });
+                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
++                    if alias_why() && alias_once(placed as usize) {
++                        tracing::info!(
++                            view = ?placed,
++                            texture = ?source,
++                            written_bytes = bytes[0],
++                            read_bytes = bytes[1],
++                            alike,
++                            "an alias copy is not made: the two textures' footprints differ"
++                        );
++                    }
+                     return false;
+                 }
+                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
+@@ -279,6 +317,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+                 let through = Arc::new(Through {
+                     buffer,
+                     parts: of_written.into_iter().zip(of_read).collect(),
++                    epoch: std::sync::atomic::AtomicU64::new(0),
+                 });
+                 map.insert(placed as usize, through.clone());
+                 through
+@@ -288,7 +327,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+     let first = list.first_use(placed as usize);
+     // The source's first use in the list records nothing (its prelude
+     // brings it to the state); a use in another way since the last copy
+-    // shows as a change of state.
++    // shows as a change of state. A host copy that wrote the source since
++    // (the decoration bake copies its tiles into the atlas on its own
++    // list) is not seen by either: the epoch is.
++    let epoch = written_epoch(source as usize);
+     let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+         let state = crate::host::legal_state(texture, COPY_SOURCE);
+         let barrier = crate::host::transition(
+@@ -300,9 +342,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+         unsafe { list.list.ResourceBarrier(&[barrier]) };
+         before
+     });
+-    if !first && before.is_none() {
++    if !first
++        && before.is_none()
++        && through.epoch.load(std::sync::atomic::Ordering::Relaxed) == epoch
++    {
+         return true;
+     }
++    through
++        .epoch
++        .store(epoch, std::sync::atomic::Ordering::Relaxed);
+     card_writes(list, placed, to, None);
+     crate::list::ensure_state(list, placed, COPY_DEST);
+     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+@@ -570,23 +618,74 @@ pub(crate) fn let_go_idle() {
+ /// the host, not in title memory, which stays as it was.
+ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+ 
++/// Counts [`host_written`] calls: a source written since [`alias`] last
++/// copied it is copied again (the decoration bake's atlas gets its tiles
++/// on the bake's own list, long after a list that reads a view of it was
++/// recorded).
++static WRITTEN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++static WRITTEN_EPOCHS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
++
++/// The [`WRITTEN_EPOCH`] of the last host write to `resource`, 0 if none.
++pub(crate) fn written_epoch(resource: usize) -> u64 {
++    let epochs = WRITTEN_EPOCHS.lock().unwrap_or_else(|e| e.into_inner());
++    epochs
++        .as_ref()
++        .and_then(|m| m.get(&resource).copied())
++        .unwrap_or(0)
++}
++
+ /// A host copy or resolve writes `resource`.
+ pub(crate) fn host_written(resource: This) {
++    let epoch = WRITTEN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    WRITTEN_EPOCHS
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .get_or_insert_with(HashMap::new)
++        .insert(resource as usize, epoch);
+     let new = {
+         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+         set.get_or_insert_with(Default::default).insert(resource as usize)
+     };
+     // Diagnostics (run 177): where its title memory is, for placed views
+     // the title reads that memory through ([`placed_in_host_written`]).
+-    if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
++    // Not only on the first write: a texture can be copied into before the
++    // title memory it lands in is known (a host copy made late), and the
++    // address must be recorded when it is. A texture whose address moved
++    // (its memory was released and made again) is recorded again too.
++    if let Some((at, desc)) = crate::resource::texture_memory(resource) {
+         // SAFETY: 56 bytes in the description's layout.
+         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
++        {
++            let mut by_desc = HOST_WRITTEN_DESC.lock().unwrap_or_else(|e| e.into_inner());
++            let list = by_desc.entry(desc_key(&words)).or_default();
++            if !list.contains(&(resource as usize)) {
++                list.push(resource as usize);
++            }
++        }
+         if !at.is_null() && bytes > 0 {
+-            HOST_WRITTEN_AT
+-                .lock()
+-                .unwrap_or_else(|e| e.into_inner())
+-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
++            let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
++            let known = map.get(&(at as u64)).is_some_and(|d| d.5 == resource as usize);
++            if new || !known {
++                map.insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
++            }
++        }
++        if alias_why() {
++            use std::sync::atomic::{AtomicU64, Ordering};
++            static SAID: AtomicU64 = AtomicU64::new(0);
++            if SAID.fetch_add(1, Ordering::Relaxed) < 200 {
++                tracing::info!(
++                    resource = ?resource,
++                    at = format_args!("{:#x}", at as u64),
++                    bytes,
++                    width = words[4],
++                    height = words[6],
++                    layers_levels = format_args!("{:#x}", words[7]),
++                    format = words[8],
++                    new,
++                    "host write recorded"
++                );
++            }
+         }
+     }
+ }
+@@ -597,6 +696,51 @@ pub(crate) fn host_written(resource: This) {
+ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
+     Mutex::new(std::collections::BTreeMap::new());
+ 
++/// Textures the host copied into, by description (words 1 and 13 are
++/// filler and left out), for a placed view whose address the copy's own
++/// resource does not carry: the title creates the copy's destination as a
++/// resource of its own, while a placed view names only the console
++/// address. One description names several textures often; only an
++/// unambiguous one is used ([`host_written_like`]).
++static HOST_WRITTEN_DESC: Mutex<std::collections::BTreeMap<[u32; 14], Vec<usize>>> =
++    Mutex::new(std::collections::BTreeMap::new());
++
++fn desc_key(desc: &[u32; 14]) -> [u32; 14] {
++    let mut key = *desc;
++    key[1] = 0;
++    key[13] = 0;
++    key
++}
++
++/// The one texture the host copied into that has `desc`'s shape, if there
++/// is exactly one. A placed view of a texture the title copied into can
++/// carry only the console address, which the copy's resource does not
++/// name; this is the bridge for those views.
++pub(crate) fn host_written_like(desc: &[u32; 14]) -> Option<This> {
++    if !like() {
++        return None;
++    }
++    let key = desc_key(desc);
++    let map = HOST_WRITTEN_DESC.lock().unwrap_or_else(|e| e.into_inner());
++    let list = map.get(&key)?;
++    let mut live = list.iter().copied().filter(|&r| {
++        HOST_WRITTEN
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .as_ref()
++            .is_some_and(|set| set.contains(&r))
++    });
++    let first = live.next()?;
++    live.next().is_none().then_some(first as This)
++}
++
++/// `VICTORY_ALIAS_LIKE=0`: a placed view is not matched to a texture the
++/// host copied into by its description alone.
++fn like() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_LIKE").is_none_or(|v| v != "0"))
++}
++
+ /// A texture the title placed at `address` (description words `desc`) was
+ /// made: says so once if it lies in the memory of a texture the host
+ /// copied into ([`host_written`]). Its own host copy is filled from title
+@@ -650,10 +794,36 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
+ /// never reached.
+ pub(crate) fn host_written_at(address: u64) -> Option<This> {
+     let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+-    map.range(..=address)
+-        .next_back()
+-        .filter(|(at, d)| address < **at + d.0)
+-        .map(|(_, d)| d.5 as This)
++    // Not only the nearest address below: a smaller texture the host wrote
++    // can start inside the span of a larger one (the bake's atlas has other
++    // textures packed in its memory). The nearest below then does not cover
++    // `address` while an older, larger one does. Walk back until one does.
++    let mut near = None;
++    let mut hit = None;
++    for (at, d) in map.range(..=address).rev() {
++        if near.is_none() {
++            near = Some((*at, d.0));
++        }
++        if address < *at + d.0 {
++            hit = Some(d.5 as This);
++            break;
++        }
++    }
++    if hit.is_none() && alias_why() {
++        static SAID: std::sync::Mutex<std::collections::BTreeSet<u64>> =
++            std::sync::Mutex::new(std::collections::BTreeSet::new());
++        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
++        if said.len() < 64 && said.insert(address) {
++            let nearest = near.map(|(at, bytes)| format!("{at:#x}+{bytes}"));
++            tracing::info!(
++                address = format_args!("{address:#x}"),
++                entries = map.len(),
++                nearest = nearest,
++                "no host-written texture covers a placed view's address"
++            );
++        }
++    }
++    hit
+ }
+ 
+ /// The title released a resource.
+@@ -669,6 +839,16 @@ pub(crate) fn forget(resource: usize) {
+     // Its memory may be given to other textures now (run 177: most of the
+     // "HERO LEAD" lines were views in memory a released texture had held).
+     HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
++    {
++        let mut by_desc = HOST_WRITTEN_DESC.lock().unwrap_or_else(|e| e.into_inner());
++        by_desc.retain(|_, list| {
++            list.retain(|&r| r != resource);
++            !list.is_empty()
++        });
++    }
++    if let Some(epochs) = WRITTEN_EPOCHS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
++        epochs.remove(&resource);
++    }
+     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+     if let Some(through) = through.as_mut() {
+         through.remove(&resource);

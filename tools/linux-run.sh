@@ -338,6 +338,7 @@ echo "hud: $HUD_LABEL"
     echo "exe=$EXE"
     echo "game=$GAME console=$CONSOLE proton=$PROTON"
     echo "log=$LOG"
+    echo "thp=${LOG%.txt}.thp"
     echo "hud=$HUD_LABEL"
 } >"$LOG.run"
 
@@ -347,11 +348,23 @@ echo "hud: $HUD_LABEL"
 # (`linux/thp/`); nothing else about the run changes. `VICTORY_THP=0`: not.
 thp() {
     local helper=$ROOT/linux/thp/victory-thp-collapse
+    local out_file=${LOG%.txt}.thp last=
     [ "${VICTORY_THP:-1}" = 1 ] || return 0
-    [ -x "$helper" ] || return 0
+    if [ ! -x "$helper" ]; then
+        echo "huge pages: off (build $helper, see linux/thp/README.md)" >&2
+        return 0
+    fi
+    if ! command -v getcap >/dev/null; then
+        echo "huge pages: off (getcap not found: install libcap to check cap_sys_nice)" >&2
+        return 0
+    fi
+    if ! getcap "$helper" 2>/dev/null | grep -q cap_sys_nice; then
+        echo "huge pages: off ($helper lacks cap_sys_nice; see linux/thp/README.md)" >&2
+        return 0
+    fi
     while sleep 15; do
         [ -n "$(pgrep -f 'victory[^ ]*\.exe run' || true)" ] || return 0
-        local pid ranges
+        local pid ranges result
         pid=$(for p in $(pgrep -f 'victory[^ ]*\.exe run' || true); do
                   echo "$(ls /proc/"$p"/task 2>/dev/null | wc -l) $p"
               done | sort -rn | awk 'NR==1{print $2}')
@@ -360,7 +373,11 @@ thp() {
             | sed -E 's/.*at=0x([0-9a-f]+) len=([0-9]+)/\1 \2/' | sort -u \
             | while read -r a l; do printf "%x %x " $((16#$a)) $((16#$a + l)); done)
         [ -n "$ranges" ] || continue
-        "$helper" "$pid" $ranges >/dev/null 2>&1
+        result=$("$helper" "$pid" $ranges 2>&1) || true
+        if [ -n "$result" ] && [ "$result" != "$last" ]; then
+            printf '%s %s\n' "$(date +%T)" "$result" >>"$out_file"
+            last=$result
+        fi
     done
 }
 

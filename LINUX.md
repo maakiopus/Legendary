@@ -1,7 +1,9 @@
 # Legendary on Linux (Proton)
 
 **Legendary** is the Linux/Proton port of VIctory. The Windows build runs under
-Wine/Proton (Proton Experimental, AMD on Mesa/RADV tested); this file is the
+Wine/Proton (GE-Proton11-14-vt with the patched wineserver is the primary
+configuration; Proton Experimental is the fallback; AMD on Mesa/RADV tested);
+this file is the
 Linux side: what had to change for the layer to run there, how to start it, and
 what is measured. The research record is in
 [`docs/linux-research.md`](docs/linux-research.md).
@@ -61,7 +63,14 @@ cannot press a key or save a frame for you.
 
 ## Run
 
-Steam with **Proton - Experimental**. No system Wine is used.
+The primary configuration is **GE-Proton11-14-vt** (the patched 938-protocol
+wineserver); stock **Proton Experimental** is the fallback. No system Wine is
+used. `tools/linux-run.sh` defaults to Experimental, so select GE-vt with
+`PROTONPATH`:
+
+```sh
+export PROTONPATH=$HOME/.local/share/Steam/steamapps/common/GE-Proton11-14-vt
+```
 
 ### Direct (recommended)
 

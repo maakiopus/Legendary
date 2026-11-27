@@ -11,7 +11,7 @@ complements [`LINUX.md`](../LINUX.md) (how to build/run) and
 |---|---|
 | GPU / driver | AMD RX 6700 XT (RDNA 2), RADV, Mesa 26.3.1 |
 | CPU | 6 cores / 12 threads |
-| Proton | Proton Experimental (`experimental-11.0-20261112`), vkd3d-proton |
+| Proton | GE-Proton11-14-vt (patched wineserver, protocol 938) and Proton Experimental (`experimental-11.0-20261112`), vkd3d-proton |
 | Build | Windows target (`cargo xwin`, `x86_64-pc-windows-msvc`), diag profile |
 | Title | Xbox Series build, run with `--console series-x`, 1920x1080 |
 
@@ -113,7 +113,9 @@ fast1 (ports 1/6/7 + switches + THP) 3.4 fps last; port 6 + 6 threads 0.6 fps.
   85,933 pipelines — not from the switch set (which measured slower on our
   tree). Its useful ideas were taken: texture rechecks, private pages, THP.
 - **GE-Proton11-14 without the patched wineserver**: never reached the world
-  here (0.9–2.1 fps). Proton Experimental stays the working Proton.
+  here (0.9–2.1 fps). The patched 938-protocol server fixes that; see the
+  view-tree section below. Proton Experimental keeps its stock 931 server and
+  remains the fallback.
 - **`VICTORY_ABSENT_CACHE=1`** (remember absent regions, 6,200 queries/frame
   saved): one run stayed at the start screen, so it is opt-in until the commit
   path that bypasses `watch.rs` is found.
@@ -125,15 +127,14 @@ fast1 (ports 1/6/7 + switches + THP) 3.4 fps last; port 6 + 6 threads 0.6 fps.
 - **`VICTORY_COPY_COMPARE`** targets the move half of copies; the write watch
   is ~96 % of that cost, so it cannot fix the stalls.
 
-## Next lever: wineserver view tree
+## Wineserver view tree
 
 `kroeeee-eeee/...@a14cfcbf` patches `server/mapping.c` to keep mapped views in
 a red-black tree keyed by (process, base). Measured there: **8.3 → 17.7 fps**,
 write watch 17–26 → 4.6 ms, launch-to-world 112–120 → 43–60 s. It must be built
 from the Wine source of the Proton in use (server protocol match) and swapped
-into a copy of the Proton install; a stock Wine 11.0 server is being built
-against GE-Proton11-14 first (both report Wine 11.0), then the same for
-Experimental if the protocol matches.
+into a copy of the Proton install. The patch and packaging are in
+`linux/wineserver/` and `linux/pkgbuild/`.
 
 Built here (2026-11-27): the server protocol must match the Proton's Wine
 exactly, and it differs far more than the version string suggests — plain Wine

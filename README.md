@@ -13,10 +13,11 @@ that made Proton work, the measurements and the dead ends are in
 
 ## Linux (Proton + vkd3d): where it stands
 
-The title boots, streams and renders its world under **Proton Experimental +
-vkd3d-proton + RADV** on an RX 6700 XT. A fixed 10-minute sweep reaches the world
-(~3 min in), captures 100+ lit frames and passes: no faults, no shader drops, no
-black frames.
+The title boots, streams and renders its world under **GE-Proton11-14-vt +
+vkd3d-proton + RADV** on an RX 6700 XT. Stock Proton Experimental still works,
+but the view-tree wineserver is the primary configuration. A fixed 10-minute
+sweep reaches the world (~2 min in), captures 100+ lit frames and passes: no
+faults, no shader drops, no black frames.
 
 What it took: one back edge per loop header for dxil-spirv (the earlier black
 world: pipeline workers overflowed their stack), our helper shaders compiled to
@@ -31,15 +32,14 @@ under Wine.
 | Configuration | World | Frame |
 |---|---|---|
 | Stock Proton Experimental, defaults, Series X | reaches it in ~3 min, PASS (mean luminance 96–104, cast 1.15–1.50) | 2–4 fps, 250–300 ms, no multi-second spikes after the fixes |
-| GE-Proton11-14 + patched view-tree wineserver, defaults, Series X | reaches it in ~2 min, PASS (279 world captures) | 3.3–3.8 fps; **write-watch asking 7–9 ms** (stock: 50–132 ms) |
-| Same, Series S | PASS, water present (verified in the capture) | 3.6 fps |
+| GE-Proton11-14-vt, defaults, Series X | reaches it in ~2 min, PASS (279 world captures) | **12.9 fps, 77 ms** settled (stable4); the first streaming world is 300–380 ms |
+| Same, Series S | PASS, water present (verified in the capture) | 3.6 fps in the capture-heavy reg2s run |
 | Aggressive: Series S + port 1 + THP + copy switches | 6.0 fps | but the **water vanished**: port 1’s private pages are not watched, so streamed/ocean memory can go stale — that config is not safe |
 
-The 20 fps target is not reached yet. The GPU is ~51 ms at Series S and ~100 ms
-at Series X, so Series X alone caps near 10 fps even with a perfect CPU; the
-rest is the CPU/lock work (copies ~50 ms, copy-back ~60 ms, list steps ~77 ms)
-that the patched wineserver and the remaining ports attack. Series X stays the
-intended profile; Series S is only a test lever until those costs fall.
+The 20 fps target is not reached yet. In the settled Series X frame the GPU is
+12.9 ms, copies are 41.4 ms (21 MB), copy-back is 5.4 ms and the rest is list
+work; the streaming world is dominated by 300+ ms of copies until the texture
+queue settles. Series X stays the intended profile; Series S is only a test lever.
 
 Build and run: [`LINUX.md`](LINUX.md). Deterministic sweeps:
 [`tools/linux-sweep/`](tools/linux-sweep/README.md). Field notes:

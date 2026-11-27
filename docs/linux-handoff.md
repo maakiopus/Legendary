@@ -58,10 +58,13 @@ biggest lever (huge pages) has not been measured on a world run.
    `VICTORY_MAP_THREADS=1`, `VICTORY_CARD_BUFFERS_MIN_MB=1`
    (+`VICTORY_CARD_BUFFERS_MB=512`), `VICTORY_JOIN_COPIES=1`,
    `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_RELAY=2`, `VICTORY_CARD_STEPS=2`.
-5. Fix `release_private` before relying on port 1 teardown.
-6. Optional, largest single win: the reference's patched-wineserver view
-   tree (`linux/wineserver/wineserver-view-tree.patch`, build against
-   Proton's Wine). Not done here.
+5. `release_private` is fixed (commit 0929e8d); keep an eye on port 1
+   teardown under load rather than treating it as a blocker.
+6. The patched-wineserver view tree is in this tree
+   (`linux/wineserver/wineserver-view-tree.patch`) and a 938-protocol server
+   is built in `~/.local/share/Steam/steamapps/common/GE-Proton11-14-vt`.
+   See `linux/wineserver/README.md`. This is now the primary server for
+   GE runs, not an optional experiment.
 
 ## Running it
 

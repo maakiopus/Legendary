@@ -134,9 +134,19 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
   wineserver view tree (built here), then aDefaultUser's view-memory skip
   (ported, opt-in after the crash) and the ptrace write route (not ported).
 - **tex-recheck**: proved the indexed-texture schedule dropped slots forever
-  after five looks, and that the 256×256 bake atlas ghost came from a copy
-  into a title texture whose placed view read title memory instead of the
-  host copy; fixed both, plus full-texture scheduled looks.
+  after five looks, and fixed that plus full-texture scheduled looks. Its
+  bake-atlas theory (a copy into a title texture whose placed view read
+  title memory) did not survive the 27 Nov runs; see `ghost-27nov`.
+- **ghost-27nov**: relaxed `alias_of`'s `fills` reject and added why/epoch
+  diagnostics; the ghost stayed. Run `alias-fix1` had 59 aliases, all
+  R32_UINT→R9G9B9E5 light probes, 397 placed views with no host-written
+  source, 3 not-placed views, and 0 `shown from a texture the host wrote`.
+  The atlas is absent from the 2048×2048 misses, so it is not the placed
+  view being rejected; render-target writes from the bake are not marked
+  host-written at all. A shape bridge (HOST_WRITTEN_DESC) and P1 upload
+  guard did not boot and were reverted. Full write-up:
+  `docs/ghost-fix.md`; patch:
+  `docs/ghost-notes/2026-11-27-alias-attempt.patch`.
 - **regression-review**: no bug in the shipped defaults; ranked the water
   suspects (copy-compare zero-fill, port 1) and left two latent bugs:
   `copy_compared` lacks the remap guard, and the water readback kind fails
@@ -148,11 +158,27 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
 
 ## Where it stands
 
+- Build note, 27 Nov: do not set `VICTORY_BUILD_DXC` for Wine runs on this
+  tree while the shader gap is open. The DXIL-bundled diag build is
+  suspected of the unlit/dark models seen after it; build without the
+  variable and with no `dxc` on PATH to use the runtime
+  `d3dcompiler_47` path, which is the known-good one. The helper shaders
+  only DXC can compile are the card-compare, up-check and argument-clamp
+  ones.
+
 - Series X, defaults, GE-Proton11-14-vt: PASS, world ~2 min, settled
   **12.9 fps**, stable frame times, water, no crashes.
-- Ghosting: bake-atlas alias path engages; full-texture looks catch changes;
-  the table-slot lever (`VICTORY_UAV_RECHECK_TABLES`) is on an unmerged
-  branch waiting for the shirt-specific bisect.
+- Ghosting: still present. The 27 Nov "root cause" (placed atlas views
+  rejected by `fills` because of target/UAV flags) was disproven: after
+  relaxing it, run `alias-fix1` still had 59 aliases only for R32_UINT
+  light probes, 397 `no target or host-written texture at its address`,
+  and 0 `shown from a texture the host wrote`. The atlas is not among the
+  placed misses, so it may be sampled through the title resource, and
+  render-target writes (the bake draws) are not marked host-written at
+  all. The follow-up shape bridge did not boot and is reverted; the patch
+  and full evidence are in `docs/ghost-fix.md` /
+  `docs/ghost-notes/2026-11-27-alias-attempt.patch`. Table-slot lever
+  (`VICTORY_UAV_RECHECK_TABLES`) remains separate and unmerged.
 - 20 fps: not reached. Copy path (41 ms at 21 MB) is the next cut: guard
   `copy_compared` with the remap reader, then a safe `COPY_COMPARE=1` A/B;
   then card-side compare and relay. Series X GPU floor is ~13 ms settled,
