@@ -9480,6 +9480,15 @@ impl Meter {
                          the memory as it was, {changed} found it changed (uploaded again)"
                     );
                 }
+                {
+                    let [writes, dropped, shown, due, most] =
+                        [0, 1, 2, 3, 4].map(|i| crate::descriptor::host::UAV_RECHECK[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "textures written through unordered access, since the start: {writes} writes of title textures \
+                         ({dropped} ranges dropped); {shown} slots of placed textures show their memory, {due} made due \
+                         (at most {most} in one frame, spread over the frames behind it; VICTORY_UAV_RECHECK=0: not told)"
+                    );
+                }
                 tracing::info!(
                     "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
                     u8::from(crate::descriptor::host::show_new_later()),

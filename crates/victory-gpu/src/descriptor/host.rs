@@ -850,6 +850,63 @@ pub(crate) fn page_written(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Title textures a shader wrote through unordered access since a texture
+/// pass last took them ([`uav_written`]), by span of title memory: such a
+/// write changes memory with no descriptor write and no CPU write the
+/// watch sees, so only the pass's looks find it.
+static UAV_WRITTEN: Mutex<std::collections::BTreeSet<(u64, u64)>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Since the start: writes of title textures through unordered access
+/// noted, and ranges dropped when too many were kept; slots of placed
+/// textures that show the written memory, and of those the slots made due
+/// (a bounded number a frame) and the most made due in one frame.
+pub(crate) static UAV_RECHECK: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Slots one frame may make due for such writes: a burst of looks is a
+/// frame of hashing and uploading, and the user sees that spike; the rest
+/// wait their turn.
+const UAV_DUE_A_FRAME: u64 = 32;
+
+/// Whether a title texture a shader writes through unordered access is
+/// looked at again by the texture pass (`VICTORY_UAV_RECHECK=0`: no; only
+/// the 400-frame look of a texture picked by index finds the write, late).
+fn uav_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// Title texture `resource` was written by a shader through unordered
+/// access ([`crate::draw::readable`]): keep the span of title memory its
+/// view covers for the next texture pass, which makes the slots that show
+/// it due ([`HostHeap::texture_slots_uav_written`]). Only a texture whose
+/// memory is title memory itself: a host texture's writes stay on the card
+/// and reach no view the title samples. Locks one mutex, and calls nothing
+/// under it.
+pub(crate) fn uav_written(resource: crate::object::This) {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 15;
+    if !uav_recheck() || !crate::resource::title_address(resource) {
+        return;
+    }
+    let Some((at, len)) = crate::texture::title_span(resource, 0) else {
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    UAV_RECHECK[0].fetch_add(1, Relaxed);
+    let range = (at, at.saturating_add(len));
+    let mut ranges = UAV_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len() >= MOST && !ranges.contains(&range) {
+        UAV_RECHECK[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.insert(range);
+}
+
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
@@ -2062,6 +2119,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
+        self.texture_slots_uav_written(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -2152,6 +2210,69 @@ impl HostHeap {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
         }
         [held, slots.len(), slots.len()]
+    }
+
+    /// Takes the title textures shaders wrote through unordered access
+    /// since the last call ([`uav_written`]) and makes the slots that show
+    /// their memory due ([`HostHeap::slots_uav_written`]). Returns how many
+    /// it made due.
+    fn texture_slots_uav_written(&self, frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Once a frame: a pass runs several times, and the slots a frame
+        // may make due are the bound that keeps the looks from bursting.
+        static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        if FRAME.swap(frame, Relaxed) == frame {
+            return 0;
+        }
+        let ranges: Vec<(u64, u64)> =
+            std::mem::take(&mut *UAV_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()))
+                .into_iter()
+                .collect();
+        if ranges.is_empty() {
+            return 0;
+        }
+        self.slots_uav_written(&ranges, frame)
+    }
+
+    /// [`HostHeap::texture_slots_uav_written`] for `ranges` (start, end):
+    /// the slots of placed textures that show them, made due in turn, at
+    /// most [`UAV_DUE_A_FRAME`] a frame, so a shader that writes many
+    /// textures at once does not make one frame hash and upload them all.
+    /// A slot still waiting for its first upload is left as it is: that
+    /// upload takes the bytes that are there by then. Slots tables read
+    /// are left to their draws.
+    fn slots_uav_written(&self, ranges: &[(u64, u64)], frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut ranges = ranges.to_vec();
+        join(&mut ranges);
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges
+                .iter()
+                .flat_map(|&(start, end)| placed.slots_in(start, end))
+                .collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        UAV_RECHECK[2].fetch_add(slots.len() as u64, Relaxed);
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        // Uploaded before: out of the queue, or in it after an upload (as
+        // `slots_written_under`).
+        slots.retain(|slot| {
+            textures
+                .slots
+                .get(slot)
+                .is_none_or(|w| w.mapped > 0 || w.checked.2 != 0)
+        });
+        let due = slots.len() as u64;
+        for (i, &slot) in slots.iter().enumerate() {
+            let when = frame + 1 + i as u64 / UAV_DUE_A_FRAME;
+            textures.changed(slot, frame, when);
+        }
+        UAV_RECHECK[3].fetch_add(due, Relaxed);
+        UAV_RECHECK[4].fetch_max(due, Relaxed);
+        slots.len()
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -6083,6 +6204,42 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A title texture a shader wrote through unordered access makes the
+    /// slots that show its memory due, a few a frame: a burst of looks is a
+    /// frame of hashing and uploading.
+    #[test]
+    fn uav_writes_make_their_texture_slots_due_a_few_a_frame() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        let at = 0x7feb_0000_0000u64;
+        // 64x64 BC7, one mip, at addresses no test and no title uses.
+        let desc = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let len = crate::resource::placed_bytes(&desc).unwrap();
+        let stride = len + (64 << 10);
+        let view = |address: u64| {
+            let mut words = [0u32; 16];
+            (words[10], words[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, desc, words)
+        };
+        for slot in 0..40u32 {
+            let view = view(at + u64::from(slot) * stride);
+            assert!(heap.note_buffer(slot + 1, Some(&view), false).is_empty());
+        }
+        // Out of the queue, as slots uploaded before are.
+        let queued: Vec<(u32, u64)> = heap.texture_slots_due(u64::MAX, 64, true).0;
+        assert_eq!(queued.len(), 40);
+        for (slot, write) in queued {
+            heap.texture_slot_done(slot, write, None);
+        }
+        let range = [(at, at + 40 * stride)];
+        assert_eq!(heap.slots_uav_written(&range, 100), 40);
+        assert!(heap.texture_slots_due(100, 64, true).0.is_empty());
+        // 32 the next frame, the 8 behind them the frame after.
+        assert_eq!(heap.texture_slots_due(101, 64, true).0.len(), 32);
+        assert_eq!(heap.texture_slots_due(102, 64, true).0.len(), 40);
     }
 
     /// A write of no placed texture view forgets the slot in the spans
