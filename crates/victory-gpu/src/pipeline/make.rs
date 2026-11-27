@@ -41,6 +41,10 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// When a worker took it to make (unset until then), and whether
+    /// draws have been told to stop waiting for that worker.
+    claimed: OnceLock<Instant>,
+    stall_noted: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
 }
@@ -68,11 +72,35 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            claimed: OnceLock::new(),
+            stall_noted: AtomicBool::new(false),
         }
     }
 
     pub(super) fn key(&self) -> &str {
         &self.key
+    }
+
+    /// Whether a worker has held it longer than any compile should take (at
+    /// `now`). Logged once. The worker is left to finish: a pipeline it
+    /// makes later is used as any other.
+    fn stalled(&self, now: Instant) -> bool {
+        let Some(&claimed) = self.claimed.get() else {
+            return false;
+        };
+        let held = now.saturating_duration_since(claimed);
+        if held < STALLED {
+            return false;
+        }
+        if !self.stall_noted.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                shaders = ?self.shaders,
+                key = %self.key,
+                held_s = held.as_secs(),
+                "a host pipeline worker has not returned; draws no longer wait for this pipeline"
+            );
+        }
+        true
     }
 
     fn make(&self) {
@@ -385,6 +413,12 @@ fn screens_first() -> bool {
     !screen_budget().is_zero()
 }
 
+/// How long a worker may hold a pipeline before draws stop waiting for
+/// it: well past the longest compile measured (3.4 s). Under Wine, workers
+/// have not returned from the host's compute pipeline creation, and every
+/// frame then spent its whole budget waiting for the same pipelines.
+const STALLED: Duration = Duration::from_secs(15);
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -403,7 +437,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if !p.stalled(Instant::now()) {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -592,6 +628,7 @@ impl Queue {
         }
         let p = p?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
+        let _ = p.claimed.set(Instant::now());
         Some(p)
     }
 }
@@ -645,6 +682,20 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// The stack every worker is given: 8 MiB, or more if `RUST_MIN_STACK`
+/// asks for more. The default 2 MiB overflowed under Wine
+/// (`virtual_setup_exception stack overflow`) while the driver compiled
+/// real compute pipelines.
+fn worker_stack() -> usize {
+    static STACK: OnceLock<usize> = OnceLock::new();
+    *STACK.get_or_init(|| {
+        std::env::var("RUST_MIN_STACK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(8 << 20, |min| min.max(8 << 20))
+    })
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -674,6 +725,7 @@ fn spawn_worker(screens_only: bool) -> bool {
     let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{slot}"))
+        .stack_size(worker_stack())
         .spawn(move || {
             WORKER_SLOT.set(slot);
             // Below the title's own threads (loading, recording),
@@ -844,5 +896,41 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    /// A worker that never returns from the host's compile (seen under
+    /// Wine) is no longer waited for once it has held the pipeline past
+    /// `STALLED`; it is not given up on, and what it makes is used.
+    #[test]
+    fn draws_stop_waiting_for_a_worker_that_does_not_return() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let later = Instant::now() + STALLED + Duration::from_secs(1);
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&p, REQUESTED), Some(true));
+        assert!(!p.stalled(later), "queued, not claimed");
+        let p = queue.pop(false, 1).unwrap();
+        assert!(!p.stalled(Instant::now()), "a compile under the limit");
+        assert!(p.stalled(later));
+        assert!(p.stall_noted.load(Ordering::Relaxed));
+        assert!(p.stalled(later), "logged once, still not waited for");
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), MAKING);
+
+        // ready() returns without spending the frame's budget on it (timed
+        // only with a budget long enough to tell).
+        let stuck = Arc::new(Pending::new(Vec::new(), None));
+        stuck.queue_state.store(MAKING, Ordering::Relaxed);
+        if let Some(long_ago) = Instant::now().checked_sub(STALLED * 2) {
+            stuck.claimed.set(long_ago).unwrap();
+            let started = Instant::now();
+            assert!(ready(&stuck).is_none());
+            let budget = wait_budget();
+            if budget >= Duration::from_millis(100) {
+                assert!(started.elapsed() < budget / 2);
+            }
+        }
+
+        // The worker returns at last: its answer is the pipeline's.
+        p.make();
+        assert!(matches!(p.made.get(), Some(None)));
     }
 }
