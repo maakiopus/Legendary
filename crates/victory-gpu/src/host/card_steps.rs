@@ -347,11 +347,16 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
             _ => {}
         }
     }
+    Ok(dependency_levels(does, &order))
+}
+
+/// The original pairwise planner, also used for small or degenerate inputs.
+fn pairwise_levels(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
     let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
     // The copies among them, which alone put others behind them or have to
     // stand behind others.
     let mut copies: Vec<usize> = Vec::new();
-    for &i in &order {
+    for &i in order {
         let Some((r, w)) = reads_writes(&does[i]) else {
             continue;
         };
@@ -375,7 +380,107 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         }
         out.push((i, level));
     }
-    Ok(out)
+    out
+}
+
+/// A range maximum index. Each cell represents a nonempty elementary
+/// address interval. A prior step records its level plus one, so zero
+/// means no dependency. Lazy tags retain updates covering whole nodes.
+struct LevelIndex {
+    size: usize,
+    max: Vec<u32>,
+    tag: Vec<u32>,
+}
+
+impl LevelIndex {
+    fn new(cells: usize) -> Self {
+        let size = cells.max(1).next_power_of_two();
+        Self { size, max: vec![0; 2 * size], tag: vec![0; 2 * size] }
+    }
+
+    fn raise(&mut self, from: usize, to: usize, value: u32) {
+        self.raise_at(1, 0, self.size, from, to, value);
+    }
+
+    fn raise_at(&mut self, node: usize, lo: usize, hi: usize, from: usize, to: usize, value: u32) {
+        if to <= lo || hi <= from {
+            return;
+        }
+        self.max[node] = self.max[node].max(value);
+        if from <= lo && hi <= to {
+            self.tag[node] = self.tag[node].max(value);
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        self.raise_at(node * 2, lo, mid, from, to, value);
+        self.raise_at(node * 2 + 1, mid, hi, from, to, value);
+    }
+
+    fn query(&self, from: usize, to: usize) -> u32 {
+        self.query_at(1, 0, self.size, from, to)
+    }
+
+    fn query_at(&self, node: usize, lo: usize, hi: usize, from: usize, to: usize) -> u32 {
+        if to <= lo || hi <= from {
+            return 0;
+        }
+        if from <= lo && hi <= to {
+            return self.max[node];
+        }
+        let mid = (lo + hi) / 2;
+        self.tag[node].max(self.query_at(node * 2, lo, mid, from, to))
+            .max(self.query_at(node * 2 + 1, mid, hi, from, to))
+    }
+}
+
+/// Index earlier reads and writes separately. A fill waits for overlapping
+/// writes; a copy also waits for earlier reads of its destination. Query
+/// before inserting the current step, exactly as in the pairwise planner.
+fn indexed_levels(does: &[Does], order: &[usize]) -> Option<Vec<(usize, u32)>> {
+    let mut ends = Vec::with_capacity(order.len() * 4);
+    for &i in order {
+        let (r, w) = reads_writes(&does[i])?;
+        // The old overlap predicate has special behavior for empty ranges.
+        // Keep it unchanged rather than treating a point as an interval.
+        if r.0 >= r.1 || (w != (0, 0) && w.0 >= w.1) {
+            return None;
+        }
+        ends.extend([r.0, r.1]);
+        if w.0 < w.1 {
+            ends.extend([w.0, w.1]);
+        }
+    }
+    ends.sort_unstable();
+    ends.dedup();
+    let index = |a: usize| ends.binary_search(&a).expect("collected endpoint");
+    let mut reads = LevelIndex::new(ends.len().saturating_sub(1));
+    let mut writes = LevelIndex::new(ends.len().saturating_sub(1));
+    let mut out = Vec::with_capacity(order.len());
+    for &i in order {
+        let (r, w) = reads_writes(&does[i])?;
+        let (a, b) = (index(r.0), index(r.1));
+        let mut level = writes.query(a, b);
+        if w.0 < w.1 {
+            let (c, d) = (index(w.0), index(w.1));
+            level = level.max(writes.query(c, d)).max(reads.query(c, d));
+            writes.raise(c, d, level + 1);
+        }
+        reads.raise(a, b, level + 1);
+        out.push((i, level));
+    }
+    Some(out)
+}
+
+fn dependency_levels(does: &[Does], order: &[usize]) -> Vec<(usize, u32)> {
+    // The pairwise path is cheap for fill-only or small batches. Do not
+    // allocate two interval indexes unless there are many potential pairs.
+    let copies = order.iter().filter(|&&i| matches!(does[i], Does::Copy { len, .. } if len > 0)).count();
+    if order.len().saturating_mul(copies) >= 262_144
+        && let Some(levels) = indexed_levels(does, order)
+    {
+        return levels;
+    }
+    pairwise_levels(does, order)
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -1048,6 +1153,38 @@ mod tests {
         assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
         assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
         assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
+    #[test]
+    fn indexed_dependencies_match_pairwise() {
+        let mut seed = 0x12345678u32;
+        let mut random = |n: usize| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as usize % n
+        };
+        for count in [1, 2, 17, 129, 1024, 2800] {
+            for _ in 0..8 {
+                let does: Vec<_> = (0..count).map(|_| {
+                    let src = random(8192);
+                    let dst = random(8192);
+                    let len = 1 + random(256);
+                    if random(3) == 0 {
+                        fill(src, len, true)
+                    } else {
+                        copy(dst, src, len, true)
+                    }
+                }).collect();
+                let order: Vec<_> = (0..count).filter(|_| random(5) != 0).collect();
+                let expected = pairwise_levels(&does, &order);
+                assert_eq!(indexed_levels(&does, &order), Some(expected.clone()));
+                assert_eq!(dependency_levels(&does, &order), expected);
+            }
+        }
+        let adjacent = [copy(32, 0, 16, true), fill(48, 8, true), fill(47, 2, true)];
+        assert_eq!(indexed_levels(&adjacent, &[0, 1, 2]), Some(vec![(0, 0), (1, 0), (2, 1)]));
+        let empty = [copy(32, 0, 16, true), fill(33, 0, true)];
+        assert!(indexed_levels(&empty, &[0, 1]).is_none());
+        assert_eq!(dependency_levels(&empty, &[0, 1]), pairwise_levels(&empty, &[0, 1]));
     }
 
     /// Whatever the steps, done level by level (in a level every read
