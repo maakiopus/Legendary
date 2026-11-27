@@ -16,6 +16,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // The huge-pages helper of linux/thp: a page collapser, no game data.
+    "c",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -29,10 +31,20 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    (
+        "tools/linux-sweep/analyze.py",
+        "the Linux sweep's log analyzer: plain text tooling, no build step; `py` is not a general extension (tools/linux-sweep/README.md)",
+    ),
+    (
+        "tools/linux-sweep/ab.py",
+        "the Linux sweep's before/after comparison: plain text tooling, no build step; `py` is not a general extension (tools/linux-sweep/README.md)",
+    ),
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
