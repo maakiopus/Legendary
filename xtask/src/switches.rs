@@ -78,7 +78,7 @@ fn mentions(text: &str, name: &str) -> bool {
         let longer = text[end..]
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+            .is_some_and(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         if !longer {
             return true;
         }
