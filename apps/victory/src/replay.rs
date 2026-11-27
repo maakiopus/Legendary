@@ -1,6 +1,7 @@
 //! `victory replay`: a captured frame run again (docs/replay.md).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
@@ -83,8 +84,8 @@ pub(crate) struct Replay {
     wait_lists: bool,
     /// Milliseconds to wait after sending each submission: the card stands
     /// idle between them, as it does while the title prepares the next.
-    #[arg(long, default_value_t = 0.0)]
-    pace: f64,
+    #[arg(long, default_value = "0", value_parser = parse_pace)]
+    pace: Duration,
     /// Keep the card's clocks up meanwhile (VICTORY_CARD_AWAKE=1).
     #[arg(long)]
     awake: bool,
@@ -217,6 +218,16 @@ pub(crate) struct Replay {
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
+}
+
+fn parse_pace(text: &str) -> Result<Duration, &'static str> {
+    const ERROR: &str =
+        "expected finite, non-negative milliseconds within the supported duration range";
+    let milliseconds: f64 = text.parse().map_err(|_| ERROR)?;
+    if milliseconds < 0.0 {
+        return Err(ERROR);
+    }
+    Duration::try_from_secs_f64(milliseconds / 1000.0).map_err(|_| ERROR)
 }
 
 /// `3..7` (both included) or `5`.
@@ -495,6 +506,24 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
+    #[test]
+    fn replay_rejects_invalid_pacing_before_opening_a_capture() {
+        for pace in ["NaN", "inf", "-1", "-1e-323", "1e99"] {
+            let arg = format!("--pace={pace}");
+            let error = crate::Cli::try_parse_from(["victory", "replay", "missing", &arg])
+                .err()
+                .expect("invalid pacing must be rejected during argument parsing");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("--pace"));
+        }
+        for pace in ["0", "0.125"] {
+            let arg = format!("--pace={pace}");
+            assert!(crate::Cli::try_parse_from(["victory", "replay", "missing", &arg]).is_ok());
+        }
+    }
+
     #[test]
     fn ranges() {
         assert_eq!(super::range("3..7"), Some((3, 7)));

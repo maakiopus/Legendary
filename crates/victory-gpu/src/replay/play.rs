@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::RECT;
@@ -84,9 +84,9 @@ pub struct Options {
     pub wait_all: bool,
     /// Each list sent on its own, and waited for.
     pub wait_lists: bool,
-    /// Milliseconds the sender waits after each submission, as a title does
-    /// that prepares the next one meanwhile: the card stands idle.
-    pub pace: f64,
+    /// Time the sender waits after each submission, as a title does that
+    /// prepares the next one meanwhile: the card stands idle.
+    pub pace: Duration,
     /// The card kept awake meanwhile (`crate::host::awake`).
     pub awake: bool,
     /// Run only these lists (by their place in the frame).
@@ -129,7 +129,7 @@ impl Default for Options {
             merge: true,
             wait_all: false,
             wait_lists: false,
-            pace: 0.0,
+            pace: Duration::ZERO,
             awake: false,
             only: None,
             until: None,
@@ -3072,9 +3072,9 @@ impl Player {
             for all in &submissions {
                 if !o.wait_lists {
                     self.worker.queue.ExecuteCommandLists(all);
-                    if o.pace > 0.0 {
-                        let until = Instant::now() + std::time::Duration::from_secs_f64(o.pace / 1e3);
-                        while Instant::now() < until {
+                    if !o.pace.is_zero() {
+                        let began = Instant::now();
+                        while began.elapsed() < o.pace {
                             std::thread::yield_now();
                         }
                     }
