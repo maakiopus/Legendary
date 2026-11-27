@@ -4187,19 +4187,40 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                // Without the clamp (its pipeline failed to build once, and
+                // the failure is kept), the record runs on the arguments as
+                // they are: the 65,535 cap then cuts what the clamp would
+                // have cut, and the draws run — dropping them is a black
+                // world behind a working HUD. A record whose layout the
+                // execution cannot read still does not run.
+                let bounded = if !crate::indirect::clamp_available() {
+                    if !crate::indirect::usable(
+                        (kind, step, records),
+                        offset,
+                        count_arg.as_ref().map(|(_, at)| *at),
+                    ) {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    }
+                    None
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                let (bounded, at, clamped) = match bounded {
+                    Some(scratch) => (scratch, 0, true),
+                    // The record without the clamp reads the arguments where
+                    // they are: the list's copy of them, refreshed above.
+                    None => (args.buffer.clone(), offset, false),
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
+                // A window clamps the records after this one into a scratch
+                // buffer of its own; an unclamped record read the arguments
+                // where they are, so it opens no window.
+                self.window = (windowed && clamped).then(|| Window {
                     copy: args.id(),
                     kind,
                     stride,
@@ -4208,7 +4229,7 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, at)
             }
         };
         let ran = match kind {

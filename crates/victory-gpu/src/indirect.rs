@@ -252,6 +252,27 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
+/// Whether the clamp pipeline built ([`clamp`]): without it, indirect
+/// executions run on the title's arguments as they are
+/// (`crate::draw`'s fallback) rather than being dropped — a clamp pipeline
+/// that failed once is kept failed ([`clamp`]), and the world's records
+/// would otherwise never run.
+pub(crate) fn clamp_available() -> bool {
+    clamp().is_some()
+}
+
+/// Whether the record's layout is one the execution can read
+/// ([`validate_layout`], [`bound`]'s checks without the clamp): the
+/// fallback runs such a record on the arguments as they are; a record of
+/// another layout is unusable either way.
+pub(crate) fn usable(
+    spec: (u32, u32, u32),
+    src_offset: u64,
+    count_offset: Option<u64>,
+) -> bool {
+    validate_layout(spec, src_offset, count_offset).is_some()
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
