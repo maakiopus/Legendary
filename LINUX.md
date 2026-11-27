@@ -82,10 +82,9 @@ export PROTONPATH=$HOME/.local/share/Steam/steamapps/common/GE-Proton11-14-vt
 `tools/build.sh fast`, builds and installs the patched GE-Proton package when
 `makepkg` and passwordless sudo are available, builds the huge-page helper and
 gives it `cap_sys_nice`, sets the play defaults (warn log, 0.667 render
-scale, joined card rehash, and `VKD3D_CONFIG=no_upload_hvv` so host-visible
-buffers use ReBAR/SAM), then calls `tools/linux-run.sh`.
-`RUN_BUILD_GAME=0`, `RUN_BUILD_WINE=0` and `RUN_NO_SAM=1` turn off the
-automatic steps.
+scale, joined card rehash, card steps and joined copies; `VICTORY_INPLACE`
+stays off), then calls `tools/linux-run.sh`. `RUN_BUILD_GAME=0` and
+`RUN_BUILD_WINE=0` turn off the automatic steps.
 
 ```sh
 ./run.sh /media/SSD/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe

@@ -14,10 +14,9 @@
 #     then execs tools/linux-run.sh.
 #
 # Play defaults: warn-level logging, 0.667 render scale, joined card rehash
-# runs, and VKD3D_CONFIG=no_upload_hvv so host-visible buffers go through
-# ReBAR/SAM instead of the UPLOAD heap. VICTORY_INPLACE is deliberately not
-# set: it regressed performance in testing. RUN_NO_SAM=1 leaves VKD3D_CONFIG
-# alone; RUN_BUILD_WINE=0 skips the package build.
+# runs, card steps on the card and joined copies. VICTORY_INPLACE is
+# deliberately not set: it regressed in testing. RUN_BUILD_WINE=0 and
+# RUN_BUILD_GAME=0 skip the package and exe builds.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DRY=0
@@ -31,7 +30,11 @@ PKG=proton-ge-git
 PKGDIR=$ROOT/linux/pkgbuild/wine-proton-ge
 INSTALLED=/usr/share/steam/compatibilitytools.d/$PKG
 
-if [ "$DRY" = 0 ] && [ "${RUN_BUILD_WINE:-1}" = 1 ] &&
+# Replacing victory.exe under an active run makes umu report
+# "Executable not found"; do not build anything while one is running.
+ACTIVE=$(pgrep -f 'victory[^ ]*\.exe run ' 2>/dev/null || true)
+
+if [ "$DRY" = 0 ] && [ -z "$ACTIVE" ] && [ "${RUN_BUILD_WINE:-1}" = 1 ] &&
     command -v makepkg >/dev/null 2>&1 && command -v pacman >/dev/null 2>&1 &&
     ! pacman -Q "$PKG" >/dev/null 2>&1 && [ ! -d "$INSTALLED" ]; then
     if sudo -n true 2>/dev/null; then
@@ -54,9 +57,13 @@ if [ -z "${PROTONPATH:-}" ]; then
 fi
 
 if [ "$DRY" = 0 ] && [ "${RUN_BUILD_GAME:-1}" = 1 ]; then
-    echo "run: building the diag victory.exe (RUN_BUILD_GAME=0 skips)" >&2
-    "$ROOT/tools/build.sh" fast ||
-        echo "run: build failed; the existing exe is used" >&2
+    if [ -n "$ACTIVE" ]; then
+        echo "run: a victory run is active; not rebuilding the exe" >&2
+    else
+        echo "run: building the diag victory.exe (RUN_BUILD_GAME=0 skips)" >&2
+        "$ROOT/tools/build.sh" fast ||
+            echo "run: build failed; the existing exe is used" >&2
+    fi
 fi
 
 HELPER=$ROOT/linux/thp/victory-thp-collapse
@@ -75,10 +82,6 @@ fi
 export VICTORY_LOG=${VICTORY_LOG:-warn}
 export VICTORY_RENDER_SCALE=${VICTORY_RENDER_SCALE:-0.667}
 export VICTORY_CARD_REHASH_RUNS=${VICTORY_CARD_REHASH_RUNS:-1}
-if [ "${RUN_NO_SAM:-0}" != 1 ]; then
-    case ",${VKD3D_CONFIG:-}," in
-    *,no_upload_hvv,*) ;;
-    *) export VKD3D_CONFIG="${VKD3D_CONFIG:+$VKD3D_CONFIG,}no_upload_hvv" ;;
-    esac
-fi
+export VICTORY_CARD_STEPS=${VICTORY_CARD_STEPS:-2}
+export VICTORY_JOIN_COPIES=${VICTORY_JOIN_COPIES:-1}
 exec "$ROOT/tools/linux-run.sh" "$@"
