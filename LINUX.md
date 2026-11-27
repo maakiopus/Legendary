@@ -78,6 +78,18 @@ export PROTONPATH=$HOME/.local/share/Steam/steamapps/common/GE-Proton11-14-vt
 
 ### Direct (recommended)
 
+`./run.sh <game>` is the soft wrapper: it builds and installs the patched
+GE-Proton package when `makepkg` and passwordless sudo are available, builds
+the huge-page helper and gives it `cap_sys_nice`, sets the play defaults
+(warn log, 0.667 render scale, joined card rehash, and
+`VKD3D_CONFIG=no_upload_hvv` so host-visible buffers use ReBAR/SAM), then
+calls `tools/linux-run.sh`. `RUN_BUILD_WINE=0` and `RUN_NO_SAM=1` turn off
+the two automatic steps.
+
+```sh
+./run.sh /media/SSD/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe
+```
+
 `tools/linux-run.sh` starts the layer itself: no cmd.exe window, the log is
 tailed into this terminal, gamescope runs 1920x1080@75 fullscreen, and
 MangoHud shows the clock, the frame rate, and the processor's and the card's
