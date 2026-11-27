@@ -171,7 +171,11 @@ def analyse(log: Path, captures: Path) -> int:
         from PIL import Image, ImageStat
 
         for p in sorted(shown, key=lambda x: x.stat().st_size, reverse=True)[:8]:
-            rgb = Image.open(p).convert("RGB")
+            try:
+                rgb = Image.open(p).convert("RGB")
+            except OSError as e:
+                print(f"capture_skip file={p.name} reason={e}")
+                continue
             stat = ImageStat.Stat(rgb)
             gray = rgb.convert("L")
             mean = ImageStat.Stat(gray).mean[0]

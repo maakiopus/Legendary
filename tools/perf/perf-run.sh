@@ -7,9 +7,9 @@
 # Leading NAME=VALUE arguments are exported for the sweep (sudo strips the
 # caller's environment, so this is how SWEEP_LABEL reaches it). The traces
 # land in /tmp/opencode/sweep-<label>/stalls.txt, where <label> defaults to
-# the sweep's own `sweep`, so the report lands in its directory. Requires
-# bpftrace and root (or cap_sys_bpf); without them it says what is missing
-# and runs the sweep alone.
+# the sweep's own `sweep`, so the report lands in its directory. bpftrace
+# runs through `sudo -n` when the caller is not root; without bpftrace it
+# says what is missing and runs the sweep alone.
 #
 # A debug trace of a port that lost its device: SWEEP_DEBUG=1 (the sweep
 # sets VICTORY_LOG=debug and VICTORY_D3D12_DEBUG=1, which name the command
@@ -32,10 +32,6 @@ if ! command -v bpftrace >/dev/null 2>&1; then
     echo "perf-run: no bpftrace; the sweep runs alone (install bpftrace, or read the BCC ones in tools/perf/README.md)" >&2
     exec "$@"
 fi
-if [ "$(id -u)" != 0 ]; then
-    echo "perf-run: not root — the traces need the kernel's tracepoints (sudo, or setcap cap_sys_bpf)" >&2
-fi
-
 LABEL=${SWEEP_LABEL:-sweep}
 WORK=/tmp/opencode/sweep-$LABEL
 mkdir -p "$WORK"
@@ -56,8 +52,17 @@ else
         "$TRACE" > "$RUN"
 fi
 
-# UTC, the clock app.log and perf-report.md use.
-TZ=UTC bpftrace "$RUN" > "$WORK/stalls.txt" 2>&1 &
+TRACER=(env TZ=UTC bpftrace "$RUN")
+if [ "$(id -u)" != 0 ]; then
+    if sudo -n true 2>/dev/null; then
+        echo "perf-run: bpftrace runs through sudo -n (not root)" >&2
+        TRACER=(sudo -n env TZ=UTC bpftrace "$RUN")
+    else
+        echo "perf-run: not root and sudo -n is unavailable; the tracer may fail (setcap or run as root)" >&2
+    fi
+fi
+
+"${TRACER[@]}" > "$WORK/stalls.txt" 2>&1 &
 tracer=$!
 trap 'kill "$tracer" 2>/dev/null' EXIT INT TERM
 sleep 1
