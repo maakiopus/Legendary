@@ -93,13 +93,20 @@ thp() {
     done
 }
 
+echo "log: $LOG"
+# Show the layer's log in this terminal as it is written: under Proton the
+# cmd.exe console is a separate Wine window and does not carry the layer's
+# stdout, which is why a .bat launch left an empty console.
+tail -n +1 -F "$LOG" 2>/dev/null &
+tail_pid=$!
+
 gamescope -W 1920 -H 1080 -r 75 -f --mangoapp --force-grab-cursor -- \
     umu-run "$(wine "$EXE")" run "$(wine "$GAME")" --execute --console "$CONSOLE" "$@" &
 game=$!
 thp &
 thp_pid=$!
-trap 'kill "$thp_pid" 2>/dev/null' EXIT INT TERM
+trap 'kill "$thp_pid" "$tail_pid" 2>/dev/null' EXIT INT TERM
 wait "$game"
 status=$?
-kill "$thp_pid" 2>/dev/null
+kill "$thp_pid" "$tail_pid" 2>/dev/null
 exit "$status"
