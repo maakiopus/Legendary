@@ -27,7 +27,7 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetProcessId};
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
@@ -249,7 +249,11 @@ pub extern "system" fn XMemVirtualQuery(
         // Windows would say of a view.
         const MEM_PRIVATE: u32 = 0x2_0000;
         const MEM_MAPPED: u32 = 0x4_0000;
-        if process == GetCurrentProcess()
+        // (A real handle to our own process answers as the pseudo-handle
+        // does; a handle to another process does not.)
+        let own = process == GetCurrentProcess()
+            || GetProcessId(process) == GetCurrentProcessId();
+        if own
             && matches!(info.host.Type, MEM_PRIVATE | MEM_MAPPED)
             && victory_gpu::title_memory_shown(address as usize, 1)
         {
