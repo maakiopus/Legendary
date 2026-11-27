@@ -3134,13 +3134,18 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
 /// path that makes memory without telling this file is still to be found.
 static UNCOMMITTED: Mutex<(BTreeMap<usize, usize>, u64)> = Mutex::new((BTreeMap::new(), u64::MAX));
 
-fn absent_cache() -> bool {
+pub(crate) fn absent_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_CACHE").is_some_and(|v| v == "1"))
 }
 
 /// Drops the remembered uncommitted regions that touch blocks `[first, last)`.
 fn forget_uncommitted(first: usize, last: usize) {
+    // Off (the default): nothing is remembered, so nothing to drop. The
+    // calls come from every allocate and remap notify, 2,400 a frame.
+    if !absent_cache() {
+        return;
+    }
     let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
     let gone: Vec<usize> = cache
         .0
@@ -3161,13 +3166,21 @@ fn uncommitted_end(block: usize) -> usize {
         return uncommitted_end_asked(block);
     }
     let epoch = crate::queue::presented() / 8;
+    // A new stretch of frames: the old map is swapped out and freed with no
+    // lock held (it can hold 2^16 entries and every thread waits on it).
     {
         let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
         if cache.1 != epoch {
-            cache.0.clear();
+            let old = std::mem::take(&mut *cache);
             cache.1 = epoch;
+            drop(cache);
+            drop(old);
         }
-        if let Some((_, &end)) = cache.0.range(..=block).next_back()
+    }
+    {
+        let cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.1 == epoch
+            && let Some((_, &end)) = cache.0.range(..=block).next_back()
             && block < end
         {
             return end;
@@ -3176,7 +3189,7 @@ fn uncommitted_end(block: usize) -> usize {
     let end = uncommitted_end_asked(block);
     if end > block {
         let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.1 == epoch && cache.0.len() < 1 << 18 {
+        if cache.1 == epoch && cache.0.len() < 1 << 16 {
             cache.0.insert(block, end);
         }
     }
