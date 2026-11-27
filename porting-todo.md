@@ -71,6 +71,15 @@ RSS <= 16 GiB; VRAM <= 11 GiB with GTT checked. No push.
 #428, Marvisak #3424, avatarmanz #448/#450/#454/#420/#440, Marvisak
 #3431/#3441. See the analysis.
 
+## Merged 2026-11-27 (post-review)
+
+- #497 `098d249`, #437 `5230ae1`, #536 `0bb86b0`, #575 `6d892ff`,
+  #576 `d4ca8f6`, #444 `10bac86`, avz #427 `66ca95b`, #247 `4dc2072`
+  (watch.rs hunk only).
+- Post-merge sweep `post-merge`: PASS, median 198.4 ms at 4,555 draws
+  (pre-merge 276.6 ms at 5,923); holes 1-2/frame; 102 card copies / 1,021 MB.
+  The run was closed early by hand after 25 windows.
+
 ## Open sweep question
 
 The analyzer still fails a run on in-engine cutscene black frames with
