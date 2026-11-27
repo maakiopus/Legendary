@@ -21,6 +21,17 @@
 //! anchoring is done (some 50 ms), and for good if the processor's counter
 //! does not run at one rate whatever the core does (`invariant TSC`), the
 //! wrapper calls the host.
+//!
+//! A re-anchoring holds readers off only while it sits between the reading
+//! of the counter and the new line's last word. A reader that read the old
+//! line just before the sequence turned odd, and was then taken off the core
+//! before its `rdtsc`, can still compute with the old line's rate after the
+//! new one is in place; the two rates differ by at most 1 in 2,000, so it
+//! can be ahead of the new line by up to that fraction of the time since the
+//! anchor (500 us over the longest second between anchorings). There is no
+//! fence for that reader. membench saw no backwards reading in 33 million on
+//! four threads across anchorings; the switch is off by default. (Holding
+//! the reader would cost every `ticks` a fence; the series did not.)
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
