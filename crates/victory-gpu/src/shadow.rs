@@ -169,8 +169,13 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP) or `<= 9 GiB` (8 GB cards): `(16, 512)` MiB.
+/// - `> 9 GiB` and `<= 12 GiB` (12 GB cards, whose WDDM budget is about
+///   10–11.5 GiB): `(1, 1024)` MiB. On a 12 GB card with the 16 MiB floor
+///   nearly every title buffer stayed in PC memory and the CPU compared
+///   ~275 MB of their copies a frame for shader writes; with these values
+///   26 MB, preparing 87 -> 51 ms, copy-back 43 -> 20 ms, median FPS in
+///   scenes of more than 1,500 draws 4.9 -> 8.8, VRAM at 7.9 of 10.5 GB.
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -181,10 +186,13 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
         return (16, 512);
     };
     let budget_mb = budget_bytes >> 20;
+    const NINE_GIB_MB: u64 = 9 * 1024;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
-    if budget_mb <= TWELVE_GIB_MB {
+    if budget_mb <= NINE_GIB_MB {
         (16, 512)
+    } else if budget_mb <= TWELVE_GIB_MB {
+        (1, 1024)
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -212,7 +220,7 @@ fn resolve_card_limits(
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// `<= 9 GiB` budgets, 1 MiB / 1024 MiB on 12 GB cards, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
@@ -5822,11 +5830,16 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure) and <= 9 GiB (8 GB cards) keep the baseline.
         assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(7 * GIB)), (16, 512));
         assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(9 * GIB)), (16, 512));
+
+        // 12 GB cards (> 9 GiB, <= 12 GiB): 1 MiB / 1024 MiB.
+        assert_eq!(default_card_limits_mb(Some(10 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 1024));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
