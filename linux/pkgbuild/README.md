@@ -1,14 +1,15 @@
 # PKGBUILD
 
-One package: `proton-ge-git/` is the AUR source package plus
-`../wineserver/wineserver-view-tree.patch`. `prepare()` runs GE's own
+One package: `wine-proton-ge/` is the legacy Legendary AUR source package
+(`pkgname=proton-ge-git`) plus `../wineserver/wineserver-view-tree.patch`.
+`prepare()` runs GE's own
 `patches/protonprep-valve-staging.sh` and then applies the view-tree patch to
 `wine/`, so GE's patch list and checksums are not duplicated here.
 
 Build:
 
 ```
-cd linux/pkgbuild/proton-ge-git
+cd linux/pkgbuild/wine-proton-ge
 makepkg -si
 ```
 

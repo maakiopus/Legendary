@@ -20,7 +20,7 @@ rejected.
 
 ## Packaging
 
-The package is `linux/pkgbuild/proton-ge-git/`: the AUR source package plus
+The package is `linux/pkgbuild/wine-proton-ge/`: the AUR source package plus
 this patch. It builds the full Proton-GE tree with podman and applies the
 patch in `prepare()` after GE's own patch series, so GE's patch list and
 checksums stay in one place. The patch is a listed source with its checksum;
