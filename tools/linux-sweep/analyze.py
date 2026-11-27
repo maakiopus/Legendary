@@ -142,8 +142,14 @@ def analyse(log: Path, captures: Path) -> int:
 
     # The first captures are the title's splash and loading art, not the
     # world: when the world marker is known, its captures are the evidence.
-    world_big = [p for p in big if world_start is None or frame_of(p.name) >= world_start]
-    shown = world_big or big
+    # A black world frame is a few hundred kilobytes, so it would fall out of
+    # `big`: measure every capture after the marker, whatever its size.
+    if world_start is not None:
+        shown = [p for p in pngs if frame_of(p.name) >= world_start]
+    else:
+        shown = big
+    if not shown:
+        shown = big
 
     # A large PNG can still be a black loading screen. Measure luminance of
     # the biggest captures so the sweep flags "reachable but renders nothing".
@@ -191,6 +197,9 @@ def analyse(log: Path, captures: Path) -> int:
                   f"color_cast={max(cast):.2f} blown_frac={max(blown):.3f}")
 
     print(f"log_lines={len(lines)} captures={len(pngs)} nonblank={len(big)}")
+    if world_start is not None:
+        after = [p for p in pngs if frame_of(p.name) >= world_start]
+        print(f"world_captures={len(after)} world_nonblank={sum(p.stat().st_size > 100_000 for p in after)}")
     print(f"world_marker={world or 'NONE'}")
     print(f"faults={faults} crashes={crashes} indirect_drops={indirect} depth_plane_drops={depth}")
     print(f"wine_shader_failures card_compare={card_compare} pipeline_library={library_fail} "
