@@ -3073,8 +3073,10 @@ fn is_view(start: usize, end: usize) -> bool {
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // Pages the runtime shows by `mremap` under Wine are private memory to
-    // Windows' eye; the runtime told of them.
-    if crate::inplace::shows_any(start, end) {
+    // Windows' eye; the runtime told of them. (The range's start decides, as
+    // the walk below does: a range that begins in private memory is not
+    // made a view by a view it runs into later.)
+    if crate::inplace::shows_any(start, start.saturating_add(1)) {
         return true;
     }
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3087,6 +3089,11 @@ fn is_view(start: usize, end: usize) -> bool {
         let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
         if n == 0 {
             return false;
+        }
+        // (A direct page met after a hole is a view too: the runtime told of
+        // it, though the host calls it private committed memory.)
+        if crate::inplace::shows_any(at, at.saturating_add(1)) {
+            return true;
         }
         if info.Type == MEM_MAPPED {
             return true;
