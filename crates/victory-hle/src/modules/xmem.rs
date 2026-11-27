@@ -250,12 +250,12 @@ pub extern "system" fn XMemVirtualQuery(
         const MEM_PRIVATE: u32 = 0x2_0000;
         const MEM_MAPPED: u32 = 0x4_0000;
         // (A real handle to our own process answers as the pseudo-handle
-        // does; a handle to another process does not.)
-        let own = process == GetCurrentProcess()
-            || GetProcessId(process) == GetCurrentProcessId();
-        if own
-            && matches!(info.host.Type, MEM_PRIVATE | MEM_MAPPED)
+        // does; a handle to another process does not. Asked only once the
+        // address is known to be a told view.)
+        let own = process == GetCurrentProcess();
+        if matches!(info.host.Type, MEM_PRIVATE | MEM_MAPPED)
             && victory_gpu::title_memory_shown(address as usize, 1)
+            && (own || GetProcessId(process) == GetCurrentProcessId())
         {
             let direct = info.host.Type == MEM_PRIVATE && direct::on();
             if direct {
