@@ -171,22 +171,19 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
   along (sweep-ghost4, alias-fix1), and the exe itself now carries the
   bytes `victory-dxil-bundled` when the helpers are in it, which the run
   scripts check. Without dxc a native Microsoft `d3dcompiler_47` beside
-  the exe answers the run-time compile instead
-  (`tools/d3dcompiler.sh`, fetched like winetricks fetches it).
+  the exe answers the run-time compile instead (`tools/d3dcompiler.sh`).
+  This tree does not carry the bundling commit: it compiles the helpers at
+  run time with a modern native `d3dcompiler_47` beside the exe (the 2013
+  winetricks cab rejects `cs_5_1`; see `docs/ghost-fix.md`).
 
 - Series X, defaults, GE-Proton11-14-vt: PASS, world ~2 min, settled
   **12.9 fps**, stable frame times, water, no crashes.
-- Ghosting: still present. The 27 Nov "root cause" (placed atlas views
-  rejected by `fills` because of target/UAV flags) was disproven: after
-  relaxing it, run `alias-fix1` still had 59 aliases only for R32_UINT
-  light probes, 397 `no target or host-written texture at its address`,
-  and 0 `shown from a texture the host wrote`. The atlas is not among the
-  placed misses, so it may be sampled through the title resource, and
-  render-target writes (the bake draws) are not marked host-written at
-  all. The follow-up shape bridge did not boot and is reverted; the patch
-  and full evidence are in `docs/ghost-fix.md` /
-  `docs/ghost-notes/2026-11-27-alias-attempt.patch`. Table-slot lever
-  (`VICTORY_UAV_RECHECK_TABLES`) remains separate and unmerged.
+- Ghosting: fixed (27 Nov). Cause: the 2013 Windows 8 `d3dcompiler_47.dll`
+  (winetricks' cab) rejects `cs_5_1` with `X3506`; the helper shaders fell
+  back, the card compare and clamps were not built, and the atlas host
+  copies went stale. A modern `d3dcompiler_47` (Edge 148 tested) resolves
+  it; `tools/d3dcompiler.sh` now refuses the 2013 build by SHA-256. The
+  alias/`fills` investigation below is history (`docs/ghost-fix.md`).
 - 20 fps: not reached. Copy path (41 ms at 21 MB) is the next cut: guard
   `copy_compared` with the remap reader, then a safe `COPY_COMPARE=1` A/B;
   then card-side compare and relay. Series X GPU floor is ~13 ms settled,

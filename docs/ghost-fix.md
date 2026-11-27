@@ -1,5 +1,14 @@
 # Ghosting on the character's body and shirt
 
+> **Status, 27 Nov 2026 (fixed):** the ghost was the compiler, not the
+> atlas. The 2013 Windows 8 `d3dcompiler_47.dll` (winetricks' cab)
+> rejects `cs_5_1` with `X3506`, so the helper shaders fell back, the card
+> compare and the argument clamps were never built, and the atlas host
+> copies went stale. With a modern `d3dcompiler_47` (Edge 148 tested,
+> SHA-256 `464ac23f…`) the ghost is gone. `tools/d3dcompiler.sh` now
+> refuses the 2013 build by hash; the investigation below is kept as
+> history.
+>
 > **Status, 27 Nov 2026 (revert 9bbd8a7):** the ghost is still present. The
 > GPU fixes of the merge `b5d4598` (`65498fd` alias in the texture pass,
 > `c2ab4b5` full-recheck looks) were reverted: neither fixed the ghost,

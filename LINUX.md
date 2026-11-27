@@ -21,13 +21,16 @@ These are in the tree; none changes a Windows run.
   search. Five pipeline workers died in a stack overflow, their pipelines were
   never made and the world stayed black. DXC's loops always have one latch, and
   now ours do as well.
-- **Our helper shaders are compiled with DXC into DXIL at build time**
-  (`src/dxil.rs`, `build.rs`, `shaders/`). Wine's `d3dcompiler_47` (vkd3d-shader)
-  defines no `Load4`, `Store` or `Interlocked*` on byte-address buffers, so the
-  card compare, the up check and the argument clamps did not compile there: the
-  card compare fell back to the PC's memory and indirect executions were
-  dropped. Windows still compiles at run time as before, and a build without a
-  DXC keeps that path too.
+- **The helper shaders compile at run time with a modern native
+  `d3dcompiler_47` beside the exe** (`tools/d3dcompiler.sh`). Wine's builtin
+  `d3dcompiler_47` (vkd3d-shader) defines no `Load4`, `Store` or
+  `Interlocked*` on byte-address buffers, so the card compare, the up check
+  and the argument clamps do not compile there; a modern Microsoft
+  `d3dcompiler_47` does. The 2013 Windows 8 build (winetricks' cab) rejects
+  `cs_5_1` with `X3506` and leaves the helpers uncompiled — that was the
+  ghost's cause, and the tooling now refuses it by SHA-256. Upstream's DXC
+  bundling (`b52f4e3`) is not in this tree; Windows always compiles at run
+  time.
 - **An empty host pipeline library through the vkd3d ABI** (`pipeline/library.rs`):
   vkd3d-proton refuses a null-length blob with a non-null pointer, which the
   binding passes; the library is asked for with a null pointer now, so pipelines
@@ -47,12 +50,13 @@ These are in the tree; none changes a Windows run.
 
 ## Build
 
-Needs clang/lld (as on Windows) and a DXC to bundle the helper shaders.
+Needs clang/lld (as on Windows). This tree does not bundle the helper
+shaders: stage a modern `d3dcompiler_47.dll` beside the exe
+(`tools/d3dcompiler.sh`) before a Wine run. `VICTORY_BUILD_DXC` is a no-op
+here; it only matters in a tree with the bundling commit `b52f4e3`.
 
 ```sh
 cargo install cargo-xwin            # once
-# a DXC for this host, from https://github.com/microsoft/DirectXShaderCompiler/releases
-export VICTORY_BUILD_DXC=$HOME/.cache/dxc/bin/dxc
 cargo xwin build --profile diag -p victory --features diagnostics \
     --target x86_64-pc-windows-msvc
 ```

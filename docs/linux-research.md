@@ -36,10 +36,12 @@ behave.
    `d3dcompiler_47`) defines no `Load4`/`Store`/`Interlocked*` on byte-address
    buffers, so the card compare, the up check and the argument clamps failed
    (`E5005`); title copies stayed in the PC's memory and indirect executions
-   were dropped. Fix: compile our helper HLSL with DXC into DXIL at build time
-   (`victory-gpu/build.rs`, `src/dxil.rs`, `shaders/`), used only under Wine.
-   A Proton probe verified `CreateRootSignature` + `CreateComputePipelineState`
-   accept the DXIL container and its embedded root signature.
+   were dropped. Upstream fix: compile our helper HLSL with DXC into DXIL at
+   build time (`b52f4e3`; `victory-gpu/build.rs`, `src/dxil.rs`, `shaders/`),
+   used only under Wine. This tree does not carry that commit: the helpers
+   compile at run time against a modern native `d3dcompiler_47` beside the
+   exe. The 2013 Windows 8 build rejects `cs_5_1` (`X3506`); that outdated
+   compiler caused the ghost tiles.
    Later, `any(isnan(...))`/`isinf` in the ambient stand-in was another gap
    (fixed by testing the exponent bits), and the black shirt/body boxes were
    stale indexed textures, not a compile failure.
@@ -164,8 +166,8 @@ view memory the guards already hold — 4,950 refused asks/frame) and `6dea2976`
   MangoHud (clock, CPU/GPU), THP collapse loop.
 - `linux/thp/victory-thp-collapse.c` — `process_madvise(MADV_COLLAPSE)` on
   port 1's userptr heap (`setcap cap_sys_nice+ep`).
-- `crates/victory-gpu/shaders/` — the helper shaders compiled by DXC at build
-  time for Wine.
+- `tools/d3dcompiler.sh` — stages a modern native `d3dcompiler_47` beside the
+  exe (the 2013 Windows 8 cab is broken: no `cs_5_1`).
 
 ## References
 
