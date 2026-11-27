@@ -194,6 +194,10 @@ fn parse_jobs(value: &str) -> Result<usize, &'static str> {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // (LINUXMEM.md S0, `VICTORY_TSC_CLOCK=1`) Our own clock readings
+    // without a system call, from the start.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    victory_hle::tscclock::start();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

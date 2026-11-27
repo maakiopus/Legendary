@@ -107,6 +107,8 @@ mod texture;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod tscclock; // (LINUXMEM.md S0) VICTORY_TSC_CLOCK: QueryPerformanceCounter from rdtsc
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]

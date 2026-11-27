@@ -83,6 +83,10 @@ impl HostPolicy {
         #[cfg(windows)]
         if let ImportSymbol::Name { name, .. } = symbol {
             let ours = victory_gpu::titlewrite::import(name, address);
+            // (LINUXMEM.md S0, `VICTORY_TSC_CLOCK=1`) The title's clock
+            // readings without a system call.
+            #[cfg(target_arch = "x86_64")]
+            let ours = victory_gpu::tscclock::import(name, ours);
             // Renderer port #2: records copied into the view heap are marked.
             let ours = victory_gpu::port_descriptors::import(name, ours);
             if ours != address {
