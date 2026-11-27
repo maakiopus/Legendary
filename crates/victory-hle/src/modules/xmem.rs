@@ -1212,7 +1212,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let mut changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1238,7 +1238,7 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         let at = base + i * PAGE;
-        if private_backing(at, run * PAGE, &first, run) {
+        if private_backing(at, run * PAGE, &first, run, &mut changing) {
             i += run;
             continue;
         }
@@ -1261,7 +1261,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 /// else shows them (the heap's pages are never tile-mapped). Unmapping the
 /// range gives the private memory back (`release_private`).
 /// `VICTORY_PORT_PRIVATE=0`: views as before.
-fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
+fn private_backing(at: usize, len: usize, first: &Slice, run: usize, remap: &mut victory_gpu::Remapping) -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| {
         port_on() && on_wine() && std::env::var_os("VICTORY_PORT_PRIVATE").is_none_or(|v| v != "0")
     });
@@ -1305,7 +1305,10 @@ fn private_backing(at: usize, len: usize, first: &Slice, run: usize) -> bool {
         return false;
     }
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).insert(at, len);
-    victory_gpu::title_memory_remapped(at, len);
+    // The pages are there and read-write: what is left of the telling waits
+    // until the change is done and the mapping lock is let go, joined with
+    // the other runs of private pages (`Remapping::remapped_later`).
+    remap.remapped_later(at, len);
     victory_gpu::port_private(at, len);
     static SAID: AtomicU64 = AtomicU64::new(0);
     if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -1336,9 +1339,15 @@ fn release_private(base: usize, len: usize) {
         .collect();
     for (at, n) in gone {
         private.remove(&at);
+        // What is there is nothing of ours any more: the guards forget it
+        // while it is still mapped (a block guarded, clean and known by its
+        // bits with no view behind it would be read as written, and the
+        // title's next write to it an access violation nobody takes), then
+        // the pages go back to being a placeholder of the title's.
+        victory_gpu::title_memory_unmapping(at, n);
         // SAFETY: our own private allocation, back to a placeholder.
         unsafe { VirtualFree(at as *mut c_void, n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
-        victory_gpu::title_memory_remapped(at, n);
+        // The heap opened on them is let go, now that the pages are gone.
         victory_gpu::port_private_gone(at, n);
     }
 }
