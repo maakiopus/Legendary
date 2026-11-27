@@ -1649,11 +1649,15 @@ struct Op {
     own: bool,
     /// The view there is a reservation of [`show_direct`].
     had_direct: bool,
+    /// (`VICTORY_DIRECT_BATCH=1`) Set by [`Op::run`]: the page's reservation
+    /// is made and the section's pages, at this address in the section's
+    /// whole view, are still to be shown there ([`show_pending`]); 0: not.
+    pending: AtomicUsize,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false, had_direct: false }
+        Op { at, slice, had: false, own: false, had_direct: false, pending: AtomicUsize::new(0) }
     }
 
     /// The system calls; whether the host did as asked.
@@ -1667,7 +1671,43 @@ impl Op {
         let Some(slice) = &self.slice else {
             return true;
         };
+        if direct::batched()
+            && let Some(from) = slice.section.direct_from(slice.index, 1)
+        {
+            // The reservation here, side by side with the others'; the pages
+            // of all of them are shown by one call after ([`show_pending`]).
+            if !reserve_direct(self.at, PAGE, self.own) {
+                return false;
+            }
+            self.pending.store(from, Ordering::Release);
+            return true;
+        }
         show(self.at, PAGE, slice, self.own)
+    }
+}
+
+/// (`VICTORY_DIRECT_BATCH=1`) Shows the pages of the ops whose reservations
+/// [`Op::run`] made, all in one call of the unix library; an op whose pages
+/// could not be shown is not done, and its reservation a placeholder again.
+fn show_pending(done: &mut [(Op, bool)]) {
+    let mut left: Vec<usize> =
+        (0..done.len()).filter(|&i| done[i].1 && done[i].0.pending.load(Ordering::Acquire) != 0).collect();
+    while !left.is_empty() {
+        let ops: Vec<victory_gpu::linuxmem::ShowOp> = left
+            .iter()
+            .map(|&i| victory_gpu::linuxmem::ShowOp { from: done[i].0.pending.load(Ordering::Acquire), at: done[i].0.at, bytes: PAGE })
+            .collect();
+        let shown = victory_gpu::linuxmem::show(&ops, direct::populate());
+        if shown >= left.len() {
+            return;
+        }
+        // The one that failed, then on with those after it.
+        let failed = left[shown];
+        tracing::warn!(address = format_args!("{:#x}", done[failed].0.at), "physical pages not shown by mremap");
+        // SAFETY: the reservation just made, back to a placeholder.
+        unsafe { VirtualFree(done[failed].0.at as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        done[failed].1 = false;
+        left.drain(..=shown);
     }
 }
 
@@ -1711,7 +1751,8 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             op.own = true;
         }
     }
-    let done = pool::all(ops);
+    let mut done = pool::all(ops);
+    show_pending(&mut done);
     let mut ok = true;
     for (op, done) in done {
         match op.slice {
@@ -1844,7 +1885,14 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own, had_direct: op.had_direct };
+                let op = Op {
+                    at: op.at,
+                    slice: op.slice.clone(),
+                    had: op.had,
+                    own: op.own,
+                    had_direct: op.had_direct,
+                    pending: AtomicUsize::new(op.pending.load(Ordering::Acquire)),
+                };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
@@ -1900,11 +1948,36 @@ mod direct {
         linuxmem::direct_pages()
     }
 
+    fn asked(name: &str) -> bool {
+        std::env::var(name).is_ok_and(|v| v.trim() == "1")
+    }
+
+    /// (`VICTORY_DIRECT_POPULATE=1`) The pages are faulted in as they are shown.
+    pub(super) fn populate() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| asked("VICTORY_DIRECT_POPULATE"));
+        *ON
+    }
+
+    /// (`VICTORY_DIRECT_BATCH=1`, off by default) The pages of one change of
+    /// several mappings are shown by one call of the library after all their
+    /// reservations are made, not each by its own. Off by default: until
+    /// that call a reservation is committed memory of zeros where, shown one
+    /// by one, it is so for a microsecond; whoever reads title memory while
+    /// the runtime maps it would take the zeros for the page's bytes.
+    pub(super) fn batched() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            let batched = on() && asked("VICTORY_DIRECT_BATCH");
+            if on() {
+                tracing::info!(on = batched, "VICTORY_DIRECT_BATCH: the pages of a change of several mappings shown by one call");
+            }
+            batched
+        });
+        *ON
+    }
+
     /// Shows the shared pages mapped at `from` at `at` as well.
     pub(super) fn show(from: usize, at: usize, bytes: usize) -> bool {
-        static POPULATE: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var("VICTORY_DIRECT_POPULATE").is_ok_and(|v| v.trim() == "1"));
-        linuxmem::show(&[linuxmem::ShowOp { from, at, bytes }], *POPULATE) == 1
+        linuxmem::show(&[linuxmem::ShowOp { from, at, bytes }], populate()) == 1
     }
 }
 
@@ -1912,6 +1985,21 @@ mod direct {
 /// placeholder (no wineserver request), then the section's pages at `from`
 /// moved over it.
 fn show_direct(base: usize, len: usize, from: usize, own: bool) -> bool {
+    if !reserve_direct(base, len, own) {
+        return false;
+    }
+    if !direct::show(from, base, len) {
+        tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages not shown by mremap");
+        // SAFETY: the reservation just made, back to a placeholder.
+        unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        return false;
+    }
+    true
+}
+
+/// The first half of [`show_direct`]: the committed reservation in place of
+/// the placeholder at `base`.
+fn reserve_direct(base: usize, len: usize, own: bool) -> bool {
     let reserve = || {
         // SAFETY: replaces a placeholder of exactly `len` bytes at `base`;
         // acts only on one.
@@ -1939,12 +2027,6 @@ fn show_direct(base: usize, len: usize, from: usize, own: bool) -> bool {
             error = %std::io::Error::last_os_error(),
             "mapping physical pages failed (not a placeholder?)"
         );
-        return false;
-    }
-    if !direct::show(from, base, len) {
-        tracing::warn!(address = format_args!("{base:#x}"), len, "physical pages not shown by mremap");
-        // SAFETY: the reservation just made, back to a placeholder.
-        unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
     true
