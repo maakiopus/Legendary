@@ -2,14 +2,14 @@
 # Runs the stall tracer beside a sweep: the sweep's own output plus the
 # kernel's view of where the frame time goes.
 #
-#   sudo tools/perf/perf-run.sh SWEEP_LABEL=slow ./tools/linux-sweep/run.sh
+#   tools/perf/perf-run.sh SWEEP_LABEL=slow ./tools/linux-sweep/run.sh
 #
 # Leading NAME=VALUE arguments are exported for the sweep (sudo strips the
 # caller's environment, so this is how SWEEP_LABEL reaches it). The traces
 # land in /tmp/opencode/sweep-<label>/stalls.txt, where <label> defaults to
 # the sweep's own `sweep`, so the report lands in its directory. bpftrace
-# runs through `sudo -n` when the caller is not root; without bpftrace it
-# says what is missing and runs the sweep alone.
+# runs through passwordless `sudo -n` when the caller is not root; without
+# bpftrace it says what is missing and runs the sweep alone.
 #
 # A debug trace of a port that lost its device: SWEEP_DEBUG=1 (the sweep
 # sets VICTORY_LOG=debug and VICTORY_D3D12_DEBUG=1, which name the command
@@ -54,12 +54,8 @@ fi
 
 TRACER=(env TZ=UTC bpftrace "$RUN")
 if [ "$(id -u)" != 0 ]; then
-    if sudo -n true 2>/dev/null; then
-        echo "perf-run: bpftrace runs through sudo -n (not root)" >&2
-        TRACER=(sudo -n env TZ=UTC bpftrace "$RUN")
-    else
-        echo "perf-run: not root and sudo -n is unavailable; the tracer may fail (setcap or run as root)" >&2
-    fi
+    echo "perf-run: bpftrace runs through sudo -n (passwordless)" >&2
+    TRACER=(sudo -n env TZ=UTC bpftrace "$RUN")
 fi
 
 "${TRACER[@]}" > "$WORK/stalls.txt" 2>&1 &

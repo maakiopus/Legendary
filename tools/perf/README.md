@@ -6,10 +6,11 @@ follows the run's processes and prints the futex waits, the long syscalls
 and the card's work. `tools/perf/perf-run.sh` starts it beside a sweep:
 
 ```
-sudo tools/perf/perf-run.sh SWEEP_LABEL=slow ./tools/linux-sweep/run.sh
+tools/perf/perf-run.sh SWEEP_LABEL=slow ./tools/linux-sweep/run.sh
 ```
 
-Output lands beside the sweep's (`/tmp/opencode/sweep-<label>/stalls.txt`;
+`perf-run.sh` runs bpftrace through passwordless `sudo -n` (the sweep stays
+your user). Output lands beside the sweep's (`/tmp/opencode/sweep-<label>/stalls.txt`;
 the label defaults to the sweep's own `sweep`), with the widest stalls
 echoed at the end. Every printed line is stamped with a `time("%H:%M:%S ")`
 prefix, and `perf-run.sh` runs bpftrace with `TZ=UTC`, the clock `app.log`
@@ -28,9 +29,9 @@ on its own line first, so the block after a stamp is that second's sums.
 | amdgpu_cs_ioctl | how many submissions a frame makes; a burst is the relay's |
 | amdgpu_vm_fault | the guards fault on purpose (the write watch); a flood outside a bake or a load is a mapping gone wrong |
 
-Requires bpftrace and root (or `setcap cap_sys_bpf` on it). The counts are
-sampled sums, one line a second — the biggest number of the second is the
-wall to split.
+Requires bpftrace; `perf-run.sh` runs it through passwordless `sudo -n`. The
+counts are sampled sums, one line a second — the biggest number of the second
+is the wall to split.
 
 `amdgpu_vm_fault` is absent on some kernels (7.3.6 here). `perf-run.sh`
 leaves that probe out of the runnable copy when the event is missing; a
