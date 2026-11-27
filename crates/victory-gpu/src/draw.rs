@@ -4530,6 +4530,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
+            // A texture whose memory is title memory itself changed with no
+            // descriptor write and no CPU write the watch sees: the texture
+            // pass makes the slots that show it due, a few a frame, rather
+            // than leaving them to the 400-frame look
+            // (`VICTORY_UAV_RECHECK=0`: only the look, as before).
+            crate::descriptor::host::uav_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

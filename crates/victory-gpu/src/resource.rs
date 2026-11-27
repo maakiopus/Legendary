@@ -3128,6 +3128,15 @@ pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Diges
     *made_copy(resource)?.holds.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether `this` is a resource whose memory is title memory itself: one
+/// the title made at an address (`create_at_address`) or one made for a
+/// texture the title placed there (`texture_at`). What shaders write
+/// through such a resource reaches title memory, and the views the title
+/// samples there.
+pub(crate) fn title_address(this: This) -> bool {
+    !this.is_null() && matches!(&resource(this).backing, Backing::Address(_))
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
