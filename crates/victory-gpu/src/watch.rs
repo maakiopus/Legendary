@@ -2085,10 +2085,11 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
-/// Whether `block` lies in a placeholder: a reservation in which pages come
-/// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
-fn placeholder(block: usize) -> bool {
+/// What the system says of whether `block` lies in a placeholder: a
+/// reservation in which pages come to be only by mapping a view (or an
+/// allocation) in its place, which an ordinary commit cannot do. `None` where
+/// it does not tell: Wine answers no class 7 (`STATUS_INVALID_INFO_CLASS`).
+fn placeholder_told(block: usize) -> Option<bool> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2127,7 +2128,40 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    (status >= 0).then_some(region.region_type & PLACEHOLDER_RESERVATION != 0)
+}
+
+/// Whether `block` is taken for a placeholder's: as the system says
+/// ([`placeholder_told`]), or, where it does not tell, whether the block lies
+/// whole in private memory reserved without access. That is the only way
+/// `MEM_RESERVE_PLACEHOLDER` makes a placeholder, and how `XMemVirtualAlloc`
+/// makes the title's. Without it no hole was ever known under Wine, and each
+/// was asked about at every asking (9,000 to 19,000 questions a frame in the
+/// opening scene).
+/// shortcut: a reservation of the ordinary kind without access looks the
+/// same, and is taken for a hole there. A commit into one is found at once
+/// when the runtime tells of it ([`title_memory_allocated`], as it does of
+/// the title's), and otherwise only when the holes are looked at
+/// ([`look_at_holes`], a hundredth of them a frame): what is written there
+/// until then is told late. (After avatarmanz/VIctory-7900XTX#59:
+/// Kayotic1337's finding and fallback, zocram4cc's narrower test.)
+fn placeholder(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    if let Some(told) = placeholder_told(block) {
+        return told;
+    }
+    let at = block * BLOCK;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_RESERVE
+        && info.Type == MEM_PRIVATE
+        && info.AllocationProtect == PAGE_NOACCESS
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(BLOCK)
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -4392,6 +4426,63 @@ mod tests {
         }
     }
 
+    /// A reservation of the ordinary kind is asked about at every asking
+    /// where the system tells it from a placeholder; where it does not
+    /// (Wine) it is taken for a known hole. Either way what is committed
+    /// there is found: at once when the runtime tells of it, and within one
+    /// round of looks at the holes when nobody does.
+    #[test]
+    fn a_commit_into_a_plain_reservation_is_found() {
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        // SAFETY: a fresh reservation, released at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+            as usize;
+        assert_ne!(p, 0);
+        // (Block by block after the first: a range that begins in memory of
+        // the ordinary kind is no view's.)
+        let ask = |from: usize, to: usize| {
+            guard(p + from * BLOCK, p + to * BLOCK).expect("holes: as a view")
+        };
+        let held = |block: usize| guards().held.contains(p / BLOCK + block);
+        ask(0, 2);
+        assert!(ask(0, 2).is_empty(), "two holes");
+        let mistaken = known_holes() && placeholder_told(p / BLOCK).is_none();
+        assert!(held(0) == mistaken && held(1) == mistaken);
+        let commit = |block: usize| {
+            let at = p + block * BLOCK;
+            // SAFETY: a block of our reservation, and a byte of it once it is there.
+            unsafe {
+                assert!(!VirtualAlloc(at as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                (at as *mut u8).write_volatile(1);
+            }
+        };
+        commit(0);
+        title_memory_allocated(p, BLOCK);
+        assert!(!held(0));
+        assert_eq!(ask(0, 1), [p / BLOCK]);
+        commit(1);
+        let found = ask(1, 2);
+        if mistaken {
+            // Taken for a hole, it is not asked about until the holes are
+            // looked at: a hundredth of them a look, and one look to begin
+            // again.
+            assert!(found.is_empty());
+            for _ in 0..256 {
+                if !held(1) {
+                    break;
+                }
+                look_at_holes();
+            }
+            assert!(!held(1));
+            assert_eq!(ask(1, 2), [p / BLOCK + 1]);
+        } else {
+            assert_eq!(found, [p / BLOCK + 1]);
+        }
+        title_memory_freed(p, 2 * BLOCK);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// A refresh during a change of mapping guards nothing the runtime has
     /// begun to unmap: no note of it stays behind.
     #[test]
@@ -5747,9 +5838,11 @@ mod many_askers_tests {
         assert!(!super::published(at, end));
         let (_, all) = ask(fifth);
         assert_eq!(all, []);
-        // A reservation of the ordinary kind is no placeholder.
+        // A reservation of the ordinary kind is no placeholder, where the
+        // system tells (where it does not:
+        // `a_commit_into_a_plain_reservation_is_found`).
         let plain = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
-        assert!(!super::placeholder(plain / PAGE));
+        assert_ne!(super::placeholder_told(plain / PAGE), Some(true));
         super::look_at_holes();
         assert!(!super::published(at, end), "block 0 stays asked about");
         assert!(super::published(at + PAGE, end), "the others are as they were");
