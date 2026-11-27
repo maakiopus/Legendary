@@ -19,7 +19,8 @@ RSS <= 16 GiB; VRAM <= 11 GiB with GTT checked. No push.
   - [x] code review: GO. Lock order `voice -> ring` verified; apply clean;
         9/9 audio tests under Wine (including the new read-advance test);
         clippy clean; new `avrt.dll` import present in Wine.
-  - [ ] build + 900 s x 2; audio check (`takes`/`partial` counters, no cutouts)
+  - [x] merged as `098d249`; combined build green.
+  - [ ] game audio run pending (no FPS claim)
 - [ ] **#437 indexed card-step dependency planner** (small, one file; 12.1x
       synthetic planner speedup; gameplay FPS unmeasured)
   - [x] code review: GO on correctness (800k-case independent fuzz, 9/9 tests,
@@ -29,6 +30,8 @@ RSS <= 16 GiB; VRAM <= 11 GiB with GTT checked. No push.
         `card_steps.rs:905` "steps done on the card" line first; only then
         benchmark with `VICTORY_CARD_STEPS=2` (and `VICTORY_RELAY=2`). Do not
         ship the FPS claim without that measurement.
+  - [x] merged as `5230ae1`; combined build green. Threshold measurement
+        still pending.
 
 ## Batch 2 - small correctness and QoL
 
