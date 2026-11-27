@@ -45,8 +45,9 @@ ranges=$(grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" "
 ```
 
 The ranges are fixed after load; repeat a round every few seconds if you want,
-or run it once after the world is up. This tree does not start the helper by
-itself.
+or run it once after the world is up. `tools/linux-run.sh` starts the helper
+every 15 s by default (`VICTORY_THP=1`) and writes the result to
+`<log>.thp`; the game's own launcher does not.
 
 ## Setup (once)
 
