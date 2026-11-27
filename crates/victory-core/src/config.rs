@@ -140,10 +140,17 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
 
 /// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
 fn default_dir(name: &str) -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    default_dir_from(name, |key| std::env::var_os(key))
+}
+
+fn default_dir_from(
+    name: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let path = |key| env(key).filter(|value| !value.is_empty()).map(PathBuf::from);
+    let base = path("LOCALAPPDATA")
+        .or_else(|| path("XDG_CACHE_HOME"))
+        .or_else(|| path("HOME").map(|home| home.join(".cache")))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
     Ok(base.join("victory").join(name))
 }
@@ -152,6 +159,32 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn empty_default_directory_variables_are_ignored() {
+        let from_xdg = |key: &str| match key {
+            "LOCALAPPDATA" => Some(OsString::new()),
+            "XDG_CACHE_HOME" => Some("xdg".into()),
+            "HOME" => Some("home".into()),
+            _ => None,
+        };
+        assert_eq!(
+            default_dir_from("cache", from_xdg).unwrap(),
+            PathBuf::from("xdg").join("victory").join("cache")
+        );
+        let from_home = |key: &str| {
+            if key == "HOME" {
+                Some("home".into())
+            } else {
+                Some(OsString::new())
+            }
+        };
+        assert_eq!(
+            default_dir_from("data", from_home).unwrap(),
+            PathBuf::from("home").join(".cache").join("victory").join("data")
+        );
+        assert!(default_dir_from("data", |_| Some(OsString::new())).is_err());
+    }
 
     #[test]
     fn environment_overrides_file() {
