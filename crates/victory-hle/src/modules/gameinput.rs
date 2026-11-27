@@ -277,6 +277,13 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The scripted keys (`VICTORY_KEYS`) only, which are held whether the
+    /// window has focus or not. They reach a connected pad through
+    /// [`merge_scripted`]; [`Source::keys`] reports them as well.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn scripted_keys(&mut self) -> Vec<KeyState> {
+        Vec::new()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
     /// Extra stand-in pad input from the mouse when `VICTORY_KBM_GTA=1`.
@@ -312,6 +319,38 @@ fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
     }
+}
+
+/// `extra` (the scripted keys read as a stand-in pad) on top of `base` (a
+/// host pad's own state): a button either side holds is held, a trigger
+/// takes the further pull, and a stick axis adds, cut at full deflection.
+#[cfg(any(test, feature = "diagnostics"))]
+fn merge_pad(base: PadState, extra: PadState) -> PadState {
+    PadState {
+        buttons: base.buttons | extra.buttons,
+        left_trigger: base.left_trigger.max(extra.left_trigger),
+        right_trigger: base.right_trigger.max(extra.right_trigger),
+        left_x: (base.left_x + extra.left_x).clamp(-1.0, 1.0),
+        left_y: (base.left_y + extra.left_y).clamp(-1.0, 1.0),
+        right_x: (base.right_x + extra.right_x).clamp(-1.0, 1.0),
+        right_y: (base.right_y + extra.right_y).clamp(-1.0, 1.0),
+    }
+}
+
+/// Applies the `scripted` keys to the first connected host pad, by the
+/// stand-in pad's table. With a pad connected the stand-in is not there, so
+/// a title that listens to the pad would otherwise see nothing of
+/// `VICTORY_KEYS`.
+#[cfg(any(test, feature = "diagnostics"))]
+fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
+    if scripted.is_empty() {
+        return;
+    }
+    let extra = fallback(scripted);
+    let Some(pad) = pads.iter_mut().flatten().next() else {
+        return;
+    };
+    *pad = merge_pad(*pad, extra);
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -609,7 +648,12 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            // `mut` for the scripted keys below, which only a build with
+            // diagnostics (or a test) merges in.
+            #[cfg_attr(not(any(test, feature = "diagnostics")), allow(unused_mut))]
+            let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            #[cfg(any(test, feature = "diagnostics"))]
+            merge_scripted(&mut pads, &source.scripted_keys());
             let keys = source.keys();
             let stand_in_active = self.one_pad || pads.iter().all(Option::is_none);
             let mouse = source.mouse_pad(stand_in_active);
@@ -1416,21 +1460,10 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
-            if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
-            }
-            Some(pad)
+            // The scripted keys (`VICTORY_KEYS`) reach the first connected
+            // pad in `Hub::poll`, through `merge_scripted`, which also moves
+            // its sticks and triggers.
+            Some(convert(&state.Gamepad))
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1448,16 +1481,19 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
+            down.into_iter().map(key_state_for).collect()
+        }
+
+        #[cfg(any(test, feature = "diagnostics"))]
+        fn scripted_keys(&mut self) -> Vec<KeyState> {
+            #[cfg(feature = "diagnostics")]
+            {
+                scripted().into_iter().map(key_state_for).collect()
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            {
+                Vec::new()
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1584,6 +1620,17 @@ mod host {
                 pad.buttons |= RIGHT_STICK; // MMB: Look behind / Special (R3)
             }
             pad
+        }
+    }
+
+    /// A key state for `vk`: no characters (code point 0); the title reads
+    /// scan codes and virtual keys only.
+    fn key_state_for(vk: u8) -> KeyState {
+        KeyState {
+            // SAFETY: plain query.
+            scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+            virtual_key: vk,
+            ..Default::default()
         }
     }
 
@@ -1718,6 +1765,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<KeyState>,
         mouse: PadState,
         mouse_active_log: Vec<bool>,
         rumble: Vec<(usize, u16, u16)>,
@@ -1731,6 +1779,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn scripted_keys(&mut self) -> Vec<KeyState> {
+            self.0.lock().unwrap().scripted.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1970,6 +2021,54 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    /// `VICTORY_KEYS` used to reach only the stand-in pad's buttons, and
+    /// only in host slot 0, so with a pad connected in another slot a title
+    /// that listens to the pad saw nothing of the script. The keys now go
+    /// onto the first connected pad, sticks and triggers included, without
+    /// losing what the pad itself reports.
+    #[test]
+    fn scripted_keys_reach_the_first_connected_host_pad() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_x: -0.5,
+            ..Default::default()
+        };
+        {
+            let mut h = host.lock().unwrap();
+            // Slot 1, not 0: the first slot that is connected.
+            h.pads[1] = Some(physical);
+            h.scripted = vec![key(0x0D), key(b'W'), key(b'C')];
+        }
+        hub.poll();
+
+        // With a pad connected the stand-in is gone, so the script would
+        // otherwise have nowhere to go.
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let reading = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(
+            pad(reading),
+            PadState {
+                buttons: B | A,
+                left_x: -0.5,
+                left_y: 1.0,
+                right_trigger: 1.0,
+                ..Default::default()
+            }
+        );
+        release(reading);
+
+        // Nothing scripted: the pad reports only its own state.
+        host.lock().unwrap().scripted.clear();
+        hub.poll();
+        let reading = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(reading), physical);
+        release(reading);
     }
 
     #[test]
