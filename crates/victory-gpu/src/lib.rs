@@ -40,6 +40,8 @@ pub mod device;
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]
+mod dxil;
+#[cfg(windows)]
 pub mod external;
 pub mod fence;
 pub mod frame;
