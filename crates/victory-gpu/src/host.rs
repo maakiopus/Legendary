@@ -9472,6 +9472,14 @@ impl Meter {
                         crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                     );
                 }
+                {
+                    let [unchanged, changed] =
+                        [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "textures picked by index looked at again after their upload, since the start: {unchanged} looks found \
+                         the memory as it was, {changed} found it changed (uploaded again)"
+                    );
+                }
                 tracing::info!(
                     "slots of textures made while lists sent before them ran, shown once those had run (VICTORY_SHOW_NEW_LATER={}), since the start: {}",
                     u8::from(crate::descriptor::host::show_new_later()),
