@@ -70,6 +70,11 @@ fn bundled_shaders() -> Vec<Bundled> {
             defines: &[],
         },
         Bundled { name: "upcheck", source: "upcheck.hlsl", entry: "main", profile: "cs_6_0", defines: &[] },
+        // The two-plane composer (Series S presents a scene and an interface
+        // plane): vkd3d-shader refuses its source, so the composer was never
+        // made under Wine and the second plane was lost.
+        Bundled { name: "compose_vs", source: "compose.hlsl", entry: "vs", profile: "vs_6_0", defines: &[] },
+        Bundled { name: "compose_ps", source: "compose.hlsl", entry: "ps", profile: "ps_6_0", defines: &[] },
     ];
     const WIDEST: [(&str, &str); 2] = [("65535", "65535u"), ("1048576", "1048576u")];
     const REST: [&str; 2] = ["0", "1"];

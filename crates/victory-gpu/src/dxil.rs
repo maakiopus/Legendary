@@ -42,6 +42,8 @@ pub(crate) fn bundled(name: &str) -> Option<&'static [u8]> {
         Some(match name {
             "card_compare" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/card_compare.dxil"))[..],
             "upcheck" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/upcheck.dxil"))[..],
+            "compose_vs" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/compose_vs.dxil"))[..],
+            "compose_ps" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/compose_ps.dxil"))[..],
             "clamp_65535_0" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/clamp_65535_0.dxil"))[..],
             "clamp_65535_1" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/clamp_65535_1.dxil"))[..],
             "clamp_1048576_0" => &include_bytes!(concat!(env!("VICTORY_DXIL_DIR"), "/clamp_1048576_0.dxil"))[..],
