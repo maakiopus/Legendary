@@ -759,7 +759,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     })
 }
 
-/// [`kernel_written`] by `crate::linuxmem::written`.
+/// [`kernel_written`] by `crate::linuxmem::written`. The native scan resets
+/// the pages it reports (`PM_SCAN_WP_MATCHING`) and no others, which is what
+/// the GetWriteWatch path's `VICTORY_ASK_NORESET` asks for; that switch has
+/// no separate effect here.
 fn native_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     thread_local! {
         static RUNS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };

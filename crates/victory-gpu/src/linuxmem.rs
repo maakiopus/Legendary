@@ -267,6 +267,19 @@ fn state() -> &'static State {
         // The meters' clock: with the library whenever it is there, unless told not to.
         wanted[5] |= library.is_ok() && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err();
         let caps = library.as_ref().map(|l| l.caps).unwrap_or_default();
+        // (VICTORY_NATIVE_SCAN: PAGEMAP_SCAN alone is not enough; the probe
+        // asks a write-watched allocation of ours whether Wine's watches are
+        // the userfaultfd ones the scan can read. Not under Wine, no.)
+        let scan_probe = match (&library, wanted[1], caps.pagemap_scan) {
+            (Ok(library), true, non_zero) if non_zero != 0 => Some(write_watch_works(library)),
+            _ => None,
+        };
+        if scan_probe == Some(false) {
+            tracing::warn!(
+                "VICTORY_NATIVE_SCAN=1 but falling back to GetWriteWatch: this Wine does not register MEM_WRITE_WATCH memory with userfaultfd async write-protect"
+            );
+        }
+        let scan_ok = scan_probe != Some(false);
         // Our own userfaultfd, opened when asked for: why not, if not.
         let uffd = match &library {
             Ok(library) if wanted[4] => {
@@ -288,7 +301,7 @@ fn state() -> &'static State {
             let mut args = Times { user: 0, kernel: 0, error: 0 };
             library.call(4, &mut args) && args.error == 0
         });
-        let can = [library.is_ok(), caps.pagemap_scan != 0, caps.readv != 0, library.is_ok(), uffd.is_ok(), times];
+        let can = [library.is_ok(), caps.pagemap_scan != 0 && scan_ok, caps.readv != 0, library.is_ok(), uffd.is_ok(), times];
         if let (true, Ok(_), Err(why)) = (wanted[4], &library, &uffd) {
             tracing::warn!("VICTORY_GUARD_UFFD=1: no userfaultfd of ours: {why}");
         }
@@ -304,6 +317,10 @@ fn state() -> &'static State {
             ("VICTORY_NATIVE_THREAD_TIMES", "the meters' thread processor time by getrusage(RUSAGE_THREAD), no wineserver request", "GetThreadTimes"),
         ];
         for (i, (name, native, win32)) in said.into_iter().enumerate() {
+            // (The native scan's own warning above says why it fell back.)
+            if i == 1 && scan_probe == Some(false) {
+                continue;
+            }
             match (wanted[i], can[i], &library) {
                 (false, ..) => tracing::info!("{name}: off (unset): {win32}"),
                 (true, true, _) => tracing::info!("{name}=1: {native} (victory_mem.so)"),
@@ -561,13 +578,49 @@ fn scan(library: &Library, base: usize, len: usize, category: u64, flags: u64, o
     true
 }
 
+/// Whether Wine registers a `MEM_WRITE_WATCH` reservation with userfaultfd
+/// async write-protect, so that a `PAGEMAP_SCAN` of it answers: a one-time
+/// probe on an allocation of our own, run before `VICTORY_NATIVE_SCAN=1` is
+/// believed. A Wine that keeps write watches by `mprotect` refuses every
+/// asking; the switch then falls back instead of reading all watched memory
+/// as unwatched.
+fn write_watch_works(library: &Library) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const BYTES: usize = 64 * 1024;
+    // SAFETY: a fresh allocation of ours, written to and freed here.
+    let base = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            BYTES,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+        )
+    };
+    if base.is_null() {
+        return false;
+    }
+    // SAFETY: the first page of the allocation above.
+    unsafe { std::ptr::write_bytes(base.cast::<u8>(), 0x5a, KERNEL_PAGE) };
+    let mut runs = Vec::new();
+    let answered = scan(library, base as usize, BYTES, WRITTEN, 3, &mut runs);
+    // SAFETY: our allocation, released whole.
+    unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    answered && !runs.is_empty()
+}
+
 /// The pages of `[base, base + len)` written since they were last reset, as
 /// runs `(start, end)` of whole 4 KiB pages added to `out`, in order; with
 /// `reset` they count as not written from now on (what `GetWriteWatch` and
 /// its reset flag do, by the same kernel call Wine makes for them, without
 /// Wine). `None`: the range is not all write-watched memory
 /// (`MEM_WRITE_WATCH` reservations, which Wine registers with userfaultfd),
-/// and nothing was reset; or [`native_scan`] is off.
+/// and nothing was reset; or [`native_scan`] is off. A failure after some
+/// runs were found and reset returns those runs (`Some`) rather than
+/// `None`, so what was reset is never also reported as untouched; the rest
+/// of the range was not reset and is found by the next asking.
 ///
 /// Unlike `GetWriteWatch` a range over several write-watched reservations
 /// that follow one another is answered. A range must be asked this way or
@@ -582,9 +635,23 @@ pub fn written(base: usize, len: usize, reset: bool, out: &mut Vec<(usize, usize
     let before = out.len();
     DONE[1].fetch_add(1, Relaxed);
     if !scan(library, base, len, WRITTEN, u64::from(reset) | 2, out) {
-        out.truncate(before);
+        // (The kernel's pre-check covers the whole remaining range before
+        // the first reset, so a refusal normally resets nothing. The chunks
+        // answered before a later failure were reset and are in `out`: they
+        // are reported, not thrown away; what is left was not reset.)
+        let pages: usize = out[before..].iter().map(|r| (r.1 - r.0) / KERNEL_PAGE).sum();
         DONE[2].fetch_add(1, Relaxed);
-        return None;
+        if out.len() == before {
+            return None;
+        }
+        DONE[3].fetch_add(pages as u64, Relaxed);
+        tracing::warn!(
+            base = format_args!("{base:#x}"),
+            len,
+            pages,
+            "native scan stopped after some runs; those are reported, the rest was not reset"
+        );
+        return Some(());
     }
     let pages: usize = out[before..].iter().map(|r| (r.1 - r.0) / KERNEL_PAGE).sum();
     DONE[3].fetch_add(pages as u64, Relaxed);
