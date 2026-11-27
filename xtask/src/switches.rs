@@ -87,6 +87,16 @@ fn mentions(text: &str, name: &str) -> bool {
     false
 }
 
+/// `script` without its comment lines: a name a comment mentions is not a
+/// name the script reads.
+fn uncommented(script: &str) -> String {
+    script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The names of `documented` that no text of `sources` holds in quotes, no
 /// text of `scripts` gives whole, and `DOCUMENTED_ONLY` does not explain.
 fn unread<'a>(
@@ -129,6 +139,7 @@ fn documented_switches_are_read() {
         .iter()
         .filter(|p| p.ends_with(".sh"))
         .filter_map(read)
+        .map(|s| uncommented(&s))
         .collect();
     assert!(
         !documented.is_empty(),
@@ -161,6 +172,20 @@ fn finds_whole_names_only() {
     assert_eq!(
         found,
         ["VICTORY_LATE_WAIT", "VICTORY_LATE_WAITS", "VICTORY_X"]
+    );
+}
+
+#[test]
+fn a_comment_does_not_read_a_switch() {
+    let documented = names("VICTORY_LOG_DIR and VICTORY_THP");
+    assert!(documented.contains("VICTORY_LOG_DIR"));
+    let sources: [String; 0] = [];
+    let scripts = [uncommented(
+        "# VICTORY_LOG_DIR is documented only\nTHP=${VICTORY_THP:-1}",
+    )];
+    assert_eq!(
+        unread(&documented, &sources, &scripts),
+        ["VICTORY_LOG_DIR"]
     );
 }
 
