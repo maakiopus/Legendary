@@ -185,7 +185,7 @@ fn bench_indirect_draw_barriers() {
     };
     let device = &host.device;
     let clamps = [
-        make_from(device, OLD_SOURCE).expect("the old clamp"),
+        make_from(device, OLD_SOURCE, None).expect("the old clamp"),
         make_for(device).expect("the clamp"),
     ];
     // SAFETY: plain D3D12 object creation with valid descriptions; the

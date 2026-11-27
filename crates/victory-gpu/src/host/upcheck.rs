@@ -38,23 +38,7 @@ pub(crate) fn on() -> bool {
 /// be alike) and `new` (what the title has there now). Where the two are
 /// equal and the card's word is another one, it is counted, and the first
 /// found is kept: its offset, the card's value, the CPU's.
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=5, b0), SRV(t0), SRV(t1), UAV(u0)"
-cbuffer Look : register(b0) { uint at; uint words; uint was; uint now; uint found_at; };
-ByteAddressBuffer card : register(t0);
-ByteAddressBuffer cpu : register(t1);
-RWByteAddressBuffer found : register(u0);
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= words) return;
-    uint k = id.x * 4u, n;
-    uint c = card.Load(at + k), w = cpu.Load(was + k);
-    if (c == w || cpu.Load(now + k) != w) return;
-    found.InterlockedAdd(found_at, 1u, n);
-    if (n == 0u) found.Store3(found_at + 4u, uint3(at + k, c, w));
-}
-"#;
+const SOURCE: &str = include_str!("../../shaders/upcheck.hlsl");
 
 /// Bytes of an answer.
 const ANSWER: u64 = 16;
@@ -68,7 +52,13 @@ struct Pass {
 fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
-        let code = compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
+        // Under Wine vkd3d-shader defines no `InterlockedAdd` on a
+        // byte-address buffer (`E5005`), so the pass is taken from the DXIL
+        // the build made; a build without DXC (or Windows) compiles it.
+        let code = match crate::dxil::bundled_on_wine("upcheck") {
+            Some(bytes) => bytes.to_vec(),
+            None => compile(SOURCE, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?,
+        };
         // SAFETY: the code lives through the calls; the root signature is
         // inside it.
         unsafe {
