@@ -1596,6 +1596,45 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// Whether a scheduled look at an uploaded texture reads all of its title
+/// memory, not three 16 KiB probes (`VICTORY_TEXTURE_FULL_RECHECK=0`: the
+/// probes, as before). A square the title writes between the probes left
+/// the probes as they were, so the look found nothing and the slot was
+/// looked at again and again without ever being uploaded.
+pub(crate) fn full_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// The fingerprint a scheduled look compares: all of `[at, at + len)` when
+/// [`full_recheck`], else the three probes of [`fingerprint`]. Never 0.
+/// Read in 64 KiB pieces, so a large texture takes no larger buffer.
+pub(crate) fn recheck_fingerprint(at: u64, len: u64) -> u64 {
+    if !full_recheck() {
+        return fingerprint(at, len);
+    }
+    const PIECE: usize = 64 << 10;
+    let len = len as usize;
+    let mut print = 0u128;
+    let mut from = 0usize;
+    while from < len {
+        let bytes = (len - from).min(PIECE);
+        with_read(bytes, |read| {
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            );
+            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
+        });
+        from += bytes;
+    }
+    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
+    u64::from_le_bytes(first) | 1
+}
+
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
 /// For the frame listing: whether a list has uploaded `resource`'s staging
