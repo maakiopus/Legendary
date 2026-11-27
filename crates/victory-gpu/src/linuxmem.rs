@@ -276,7 +276,7 @@ fn state() -> &'static State {
         };
         if scan_probe == Some(false) {
             tracing::warn!(
-                "VICTORY_NATIVE_SCAN=1 but falling back to GetWriteWatch: this Wine does not register MEM_WRITE_WATCH memory with userfaultfd async write-protect"
+                "VICTORY_NATIVE_SCAN=1 but falling back to GetWriteWatch: the MEM_WRITE_WATCH probe failed (no allocation, or this Wine's watches are not userfaultfd async write-protect)"
             );
         }
         let scan_ok = scan_probe != Some(false);
@@ -321,19 +321,22 @@ fn state() -> &'static State {
             if i == 1 && scan_probe == Some(false) {
                 continue;
             }
+            // (Thread times default on with the library; the env may be unset.
+            // Say which way, not "=1", when the env did not ask.)
+            if i == 5 && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err() {
+                if can[5] {
+                    tracing::info!("{name}: on because victory_mem.so is loaded: {native}");
+                } else {
+                    tracing::info!("{name}: off: the library is not loaded or its times call failed: {win32}");
+                }
+                continue;
+            }
             match (wanted[i], can[i], &library) {
                 (false, ..) => tracing::info!("{name}: off (unset): {win32}"),
                 (true, true, _) => tracing::info!("{name}=1: {native} (victory_mem.so)"),
                 (true, false, Err(why)) => tracing::warn!("{name}=1 but falling back to {win32}: {why}"),
                 (true, false, Ok(_)) => tracing::warn!("{name}=1 but falling back to {win32}: this kernel cannot ({caps:?})"),
             }
-        }
-        // (The thread times are on because the library is, not because the
-        // switch was set: say so, with the way off.)
-        if can[5] && wanted[5] && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err() {
-            tracing::info!(
-                "VICTORY_NATIVE_THREAD_TIMES: on because victory_mem.so is loaded (set it to 0 for GetThreadTimes)"
-            );
         }
         State {
             direct_pages: wanted[0] && can[0],
@@ -624,10 +627,12 @@ fn write_watch_works(library: &Library) -> bool {
 /// its reset flag do, by the same kernel call Wine makes for them, without
 /// Wine). `None`: the range is not all write-watched memory
 /// (`MEM_WRITE_WATCH` reservations, which Wine registers with userfaultfd),
-/// and nothing was reset; or [`native_scan`] is off. A failure after some
-/// runs were found and reset returns those runs (`Some`) rather than
-/// `None`, so what was reset is never also reported as untouched; the rest
-/// of the range was not reset and is found by the next asking.
+/// and nothing was reset; or [`native_scan`] is off. A failure after its
+/// chunks have reset some runs returns those runs (`Some`) rather than
+/// `None`, so the completed chunks are not thrown away. (A reset ioctl that
+/// fails after its own pre-check can still leave pages of that chunk reset
+/// but unknown; the caller cannot tell a partial answer from a full one, and
+/// the switch is off by default.)
 ///
 /// Unlike `GetWriteWatch` a range over several write-watched reservations
 /// that follow one another is answered. A range must be asked this way or
@@ -645,7 +650,8 @@ pub fn written(base: usize, len: usize, reset: bool, out: &mut Vec<(usize, usize
         // (The kernel's pre-check covers the whole remaining range before
         // the first reset, so a refusal normally resets nothing. The chunks
         // answered before a later failure were reset and are in `out`: they
-        // are reported, not thrown away; what is left was not reset.)
+        // are reported, not thrown away. A reset ioctl that fails after its
+        // own pre-check is the one kernel-side unknown.)
         let pages: usize = out[before..].iter().map(|r| (r.1 - r.0) / KERNEL_PAGE).sum();
         DONE[2].fetch_add(1, Relaxed);
         if out.len() == before {
@@ -656,7 +662,7 @@ pub fn written(base: usize, len: usize, reset: bool, out: &mut Vec<(usize, usize
             base = format_args!("{base:#x}"),
             len,
             pages,
-            "native scan stopped after some runs; those are reported, the rest was not reset"
+            "native scan stopped after some runs; the completed chunks are reported, a failed chunk after its pre-check is not"
         );
         return Some(());
     }
