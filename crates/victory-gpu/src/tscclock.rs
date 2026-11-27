@@ -26,12 +26,12 @@
 //! of the counter and the new line's last word. A reader that read the old
 //! line just before the sequence turned odd, and was then taken off the core
 //! before its `rdtsc`, can still compute with the old line's rate after the
-//! new one is in place; the two rates differ by at most 1 in 2,000, so it
-//! can be ahead of the new line by up to that fraction of the time since the
-//! anchor (500 us over the longest second between anchorings). There is no
-//! fence for that reader. membench saw no backwards reading in 33 million on
-//! four threads across anchorings; the switch is off by default. (Holding
-//! the reader would cost every `ticks` a fence; the series did not.)
+//! new one is in place. The two rates are each within 1 in 2,000 of the true
+//! one, so they can differ by 1 in 1,000: about 1 ms over a second held, and
+//! more if the reader is delayed across anchorings. There is no fence for
+//! that reader. membench saw no backwards reading in 33 million on four
+//! threads across anchorings; the switch is off by default. (Holding the
+//! reader would cost every `ticks` a fence; the series did not.)
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
