@@ -13,7 +13,26 @@ use windows::core::{PCSTR, s};
 
 use crate::host::Host;
 
-const SOURCE: &str = include_str!("../shaders/compose.hlsl");
+const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+Texture2D<float4> scene : register(t0);
+Texture2D<float4> over : register(t1);
+SamplerState smooth_ : register(s0);
+struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
+[RootSignature(RS)]
+V vs(uint id : SV_VertexID) {
+    V v;
+    v.uv = float2((id << 1) & 2, id & 2);
+    v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return v;
+}
+[RootSignature(RS)]
+float4 ps(V v) : SV_Target {
+    float4 s = scene.SampleLevel(smooth_, v.uv, 0);
+    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+}
+"#;
 
 /// Whether a second presented plane is composed over the first
 /// (`VICTORY_PLANES`; on by default, `0` turns it off). It acts only when
@@ -35,13 +54,7 @@ unsafe impl Send for Composer {}
 // SAFETY: as above.
 unsafe impl Sync for Composer {}
 
-/// The shader's bytes: the DXIL the build made for Wine (vkd3d-shader
-/// refuses this source: the two-plane composer was never made there and the
-/// second plane was lost), else compiled here by FXC as Windows does.
-fn code(entry: PCSTR, target: PCSTR, bundled: Option<&'static [u8]>) -> windows::core::Result<Vec<u8>> {
-    if let Some(bytes) = bundled {
-        return Ok(bytes.to_vec());
-    }
+fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; the out pointer is
     // ours.
@@ -60,32 +73,30 @@ fn code(entry: PCSTR, target: PCSTR, bundled: Option<&'static [u8]>) -> windows:
             None,
         )?;
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes, copied out before it goes.
-    Ok(unsafe {
-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()).to_vec()
-    })
+    code.ok_or_else(windows::core::Error::empty)
 }
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         let (vs, ps) = (
-            code(s!("vs"), s!("vs_5_1"), crate::dxil::bundled_on_wine("compose_vs"))?,
-            code(s!("ps"), s!("ps_5_1"), crate::dxil::bundled_on_wine("compose_ps"))?,
+            compile(s!("vs"), s!("vs_5_1"))?,
+            compile(s!("ps"), s!("ps_5_1"))?,
         );
-        // SAFETY: the shaders' own bytes, alive through the calls; the root
-        // signature is inside them (a DXIL container keeps it too).
+        // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
+            let bytes = |b: &ID3DBlob| {
+                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs)?;
-            let bytecode = |b: &Vec<u8>| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: b.as_ptr().cast(),
-                BytecodeLength: b.len(),
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.GetBufferPointer(),
+                BytecodeLength: b.GetBufferSize(),
             };
             let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
-                VS: bytecode(&vs),
-                PS: bytecode(&ps),
+                VS: code(&vs),
+                PS: code(&ps),
                 SampleMask: u32::MAX,
                 RasterizerState: D3D12_RASTERIZER_DESC {
                     FillMode: D3D12_FILL_MODE_SOLID,
