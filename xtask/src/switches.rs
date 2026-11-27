@@ -3,10 +3,50 @@
 //! A switch is read through a string literal of its whole name
 //! (`std::env::var("VICTORY_X")`, `crate::switch::on("VICTORY_X")`,
 //! `crate::ab::pick("VICTORY_X")`), so a name the Markdown files give must
-//! appear quoted in at least one Rust file. xtask's own files are left out
-//! of the search: this module's tests name switches of their own.
+//! appear quoted in at least one Rust file. The shell wrappers under
+//! `tools/` and `run.sh` read their own `VICTORY_*` settings without quotes;
+//! a name found anywhere in a `.sh` file counts too. xtask's own files are
+//! left out of the search: this module's tests name switches of their own.
 
 use std::collections::BTreeSet;
+
+/// Names the documents may give although nothing here reads them, with the
+/// reason each is named. They are switches of a sibling tree, or ports that
+/// are still open; the documents say so at the place each appears.
+const DOCUMENTED_ONLY: &[(&str, &str)] = &[
+    (
+        "VICTORY_ALIAS_WHY",
+        "docs/ghost-fix.md §What was tried: the sibling tree's alias diagnostic",
+    ),
+    (
+        "VICTORY_BAKE_HOST",
+        "docs/ghost-fix.md §Next steps: a proposed marking, not implemented here",
+    ),
+    (
+        "VICTORY_COMPUTE_WAIT",
+        "porting-analysis.md, porting-todo.md: avatarmanz #166 is still open",
+    ),
+    (
+        "VICTORY_COMPUTE_WAIT_MS",
+        "docs/rx6700xt-linux-porting.md: named as absent, from the sibling build",
+    ),
+    (
+        "VICTORY_KEYS_FILE",
+        "docs/rx6700xt-linux-porting.md: named as absent, from the sibling build",
+    ),
+    (
+        "VICTORY_PORT_PLACED",
+        "docs/rx6700xt-linux-porting.md: the sibling tree's Vulkan layer only",
+    ),
+    (
+        "VICTORY_UAV_RECHECK_TABLES",
+        "docs/ghost-fix.md: a commit of the sibling tree, kept separate",
+    ),
+    (
+        "VICTORY_WC_NO_BACK",
+        "docs/rx6700xt-linux-porting.md: an external candidate, not implemented here",
+    ),
+];
 
 /// The `VICTORY_*` names in `text`, without trailing underscores (a prefix
 /// such as `VICTORY_` alone or `VICTORY_...` is not a name).
@@ -29,13 +69,39 @@ fn names(text: &str) -> BTreeSet<String> {
     found
 }
 
-/// The names of `documented` that no text of `sources` holds in quotes.
-fn unread<'a>(documented: &'a BTreeSet<String>, sources: &[String]) -> Vec<&'a str> {
+/// Whether `text` gives `name` as a whole name: not as the start of a
+/// longer one, such as `VICTORY_LATE_WAIT` inside `VICTORY_LATE_WAITS`.
+fn mentions(text: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = text[from..].find(name) {
+        let end = from + at + name.len();
+        let longer = text[end..]
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        if !longer {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The names of `documented` that no text of `sources` holds in quotes, no
+/// text of `scripts` gives whole, and `DOCUMENTED_ONLY` does not explain.
+fn unread<'a>(
+    documented: &'a BTreeSet<String>,
+    sources: &[String],
+    scripts: &[String],
+) -> Vec<&'a str> {
     documented
         .iter()
         .filter(|name| {
             let quoted = format!("\"{name}\"");
+            let bare = name.as_str();
             !sources.iter().any(|s| s.contains(&quoted))
+                && !scripts.iter().any(|s| mentions(s, bare))
+                && !DOCUMENTED_ONLY.iter().any(|(known, _)| *known == bare)
         })
         .map(String::as_str)
         .collect()
@@ -59,11 +125,16 @@ fn documented_switches_are_read() {
         .filter(|p| p.ends_with(".rs") && !p.starts_with("xtask/"))
         .filter_map(read)
         .collect();
+    let scripts: Vec<String> = files
+        .iter()
+        .filter(|p| p.ends_with(".sh"))
+        .filter_map(read)
+        .collect();
     assert!(
         !documented.is_empty(),
         "no VICTORY_* names found in the Markdown files"
     );
-    let dead = unread(&documented, &sources);
+    let dead = unread(&documented, &sources, &scripts);
     let report: Vec<String> = dead
         .iter()
         .map(|name| {
@@ -100,5 +171,9 @@ fn a_longer_name_does_not_read_a_shorter_one() {
         "std::env::var_os(\"VICTORY_LATE_WAITS\")".to_owned(),
         "on(\"VICTORY_WIDE_BACK\")".to_owned(),
     ];
-    assert_eq!(unread(&documented, &sources), ["VICTORY_LATE_WAIT"]);
+    let scripts = ["${VICTORY_LATE_WAITS:-1} ${VICTORY_WIDE_BACK:-0}".to_owned()];
+    assert_eq!(
+        unread(&documented, &sources, &scripts),
+        ["VICTORY_LATE_WAIT"]
+    );
 }
