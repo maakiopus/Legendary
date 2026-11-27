@@ -63,27 +63,57 @@ cannot press a key or save a frame for you.
 
 Steam with **Proton - Experimental**. No system Wine is used.
 
+### Direct (recommended)
+
+`tools/linux-run.sh` starts the layer itself: no cmd.exe window, the log is
+tailed into this terminal, gamescope runs 1920x1080@75 fullscreen, and
+MangoHud shows the clock, the frame rate, and the processor's and the card's
+load, temperature and power. The 15 s huge-page loop starts with it.
+
 ```sh
-export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
-export STEAM_COMPAT_INSTALL_PATH=$HOME/.local/share/Steam/steamapps/common/victory-run
-export STEAM_COMPAT_LIBRARY_PATHS=$HOME/.local/share/Steam/steamapps
-ln -sfn "$PWD/target/x86_64-pc-windows-msvc/diag" "$STEAM_COMPAT_INSTALL_PATH"
-umu-run 'C:\windows\system32\cmd.exe' /c game.bat
+tools/linux-run.sh /media/SSD/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe
+tools/linux-run.sh --dry-run /media/.../game_scarlett_master.exe   # plan only
 ```
 
-with `game.bat` (paths inside the prefix are `Z:` + the Unix path):
+| | |
+|---|---|
+| `VICTORY_HUD=0` | no overlay |
+| `VICTORY_HUD=1` | compact, top-left: clock, fps/frametime, CPU/GPU load, temperatures, power (default) |
+| `VICTORY_HUD=2` | full: the above plus GPU name, clocks, VRAM/RAM and the frame-time graph |
+| `VICTORY_GAMESCOPE=0` | no gamescope: `MANGOHUD=1` and the MangoHud Vulkan layer draw into the game window (`mangohud` must be installed) |
+| `VICTORY_THP=0` | no huge-page helper |
 
-```bat
-@echo off
-set VICTORY_GAME_DIR=Z:\media\SSD\GTA6.Xbox.v1.0.2.1-CYBERLEEK
-set VICTORY_CACHE_DIR=Z:\home\you\.cache\victory
-set VICTORY_KEYS=10:Enter,20:Enter,30:Enter,40:Enter,50:Enter,60:Enter,70:Enter,80:Enter
-"Z:\...\diag\victory.exe" run "Z:\...\game_scarlett_master.exe" --execute --console series-x
+The launcher sets `MANGOHUD_CONFIG`, so a value in the host's environment is
+replaced, not appended to, and the host's `MangoHud.conf` is not read; HUD
+off clears `MANGOHUD` as well. Logs go to
+`~/victory-logs/run-<stamp>.txt`, printed as `logs:` and followed in this
+terminal; `tail -f` the same path from another one.
+
+### Through cmd.exe (if you insist)
+
+`tools/linux-run.sh --bat <game>` writes
+`~/victory-logs/run-<stamp>.bat` and prints the one command that runs it
+(`--print-bat` prints the file as well). The batch starts the layer directly
+with no redirect, so the console carries the layer's stderr; it titles the
+window `VIctory - <game> - log: Z:\...`, prints that path and the Linux
+`tail -f` line before the game starts, and sets `VICTORY_LOG_FILE` so the
+file still has every line. The `VICTORY_*` variables exported when the
+batch was written are baked into it.
+
+```sh
+tools/linux-run.sh --bat /media/.../game_scarlett_master.exe
+# then the printed line, HUD and Proton included:
+# MANGOHUD_CONFIG=... gamescope ... --mangoapp -- umu-run 'C:\windows\system32\cmd.exe' /c 'Z:\home\...\run-<stamp>.bat'
 ```
 
 The title's start screen waits for A (`Enter` on the stand-in pad), so a run
-without keys sits there forever on a black screen. `--console series-x` renders
-one plane; the Series S profile is slower and softer here.
+without keys sits there forever on a black screen. `--console series-x`
+renders one plane; the Series S profile is slower and softer here.
+
+Proton's cmd.exe console is Wine's own window, and the layer's stderr is not
+attached to it: if it stays empty, the log file is the whole story, and the
+batch's title and banner point at it. The bat path has no 15 s THP loop; use
+the direct path or run the helper by hand. The sweep runner is unchanged.
 
 ## Sweep and logs
 
@@ -152,5 +182,5 @@ cc -O2 -o linux/thp/victory-thp-collapse linux/thp/victory-thp-collapse.c
 sudo setcap cap_sys_nice+ep linux/thp/victory-thp-collapse
 ```
 
-Run it by hand on the ranges the log names; the command is in
-[`linux/thp/README.md`](linux/thp/README.md). This tree has no automatic start.
+`tools/linux-run.sh` starts it every 15 s (the bat path does not); run it by
+hand with the command in [`linux/thp/README.md`](linux/thp/README.md).
