@@ -126,10 +126,14 @@ def analyse(log: Path, captures: Path) -> int:
     # A one-off black frame during startup/menu is not a rendering failure in
     # the world. Keep warnings in or after the world, or from a scene already
     # drawing enough geometry to be the world.
+    # A black frame with only the few draws of a fade or a transition (the
+    # title's first world frames, a loading cut) is not a scene that failed
+    # to render: keep the ones that came after the world marker and drew
+    # enough to be a populated frame.
     world_start = world[0] if world else None
     black_frames = [
         bf for bf in black_frames
-        if (world_start is not None and bf[0] >= world_start) or bf[3] >= 100
+        if bf[3] >= 100 and (world_start is None or bf[0] >= world_start)
     ]
 
     pngs = sorted(captures.glob("*.png")) if captures.exists() else []
