@@ -752,7 +752,8 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
 /// no, as before: they stay due, each pass looks at the same ones again
 /// and stops at the 257th). Held back, such a slot is looked at again
-/// after about four seconds or as soon as the card has room, and the pass
+/// after about twenty seconds (`VICTORY_RELOOK_MS` unless said) or as soon
+/// as the card has room, and the pass
 /// goes on to the slots behind it: the ones whose host copy exists and
 /// only wants bringing up to date, and the ones whose memory went (letting
 /// their host copies go is what makes room). What is uploaded while the
@@ -2351,21 +2352,36 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // The frames in which a slot with nothing to upload is looked at
+        // again at most (`VICTORY_RELOOK_MS`, 20,000 unless said; 4,000 and
+        // at most 256 before), between 16 and 1024. In frames alone it was
+        // 120: four minutes at the opening cutscene's half a frame per
+        // second, while the title streams by the clock. (About a second
+        // before the runtime told of the memory it maps: the looks are now
+        // only for what that does not tell.)
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         // (`took` is since the last pass, of any heap and list: several a
-        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
-        // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
+        // frame, so 256 frames was 13-18 s at 14-20 frames a second, and
+        // 1024 is 50-70 s; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's
+        // time.)
         let most = match look_ms() {
             Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
+            // `VICTORY_RELOOK_MS` (20,000 unless said; 4,000 before): a slot
+            // whose memory is not mapped is looked at again after at most
+            // that long; the runtime's mappings already make such a slot
+            // due (after fxceless/victory-fork #1246, faf709b5).
+            None => {
+                static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let relook = *RELOOK_MS.get_or_init(|| {
+                    std::env::var("VICTORY_RELOOK_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(20_000)
+                });
+                (relook / took).clamp(16, 1024)
+            }
         };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
