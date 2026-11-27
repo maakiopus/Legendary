@@ -7830,7 +7830,8 @@ fn split_line(frames: f64) {
     );
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
-         written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
+         written, {:.0} askings refused); {:.0} left out, the guards holding them as view memory (VICTORY_VIEW_ASK=0 asks the \
+         kernel); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
          as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
@@ -7839,6 +7840,7 @@ fn split_line(frames: f64) {
         a[11] / 1e6,
         a[12],
         a[10],
+        a[13],
         a[9],
         a[2],
         a[3],

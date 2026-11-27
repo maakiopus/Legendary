@@ -624,6 +624,13 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's write-watch askings of the kernel ([`kernel_written`]):
+    /// what a test counts to know an asking was left out.
+    static KERNEL_ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether an asking walks the pages without the kernel's reset, and resets
 /// only the pages it found written after (`VICTORY_ASK_NORESET=1`; off by
 /// default). What is answered is the same: a page found written is reset
@@ -698,6 +705,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let keep = no_reset();
+        #[cfg(test)]
+        KERNEL_ASKS.with(|n| n.set(n.get() + 1));
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -839,19 +848,55 @@ fn note_shared(written: &[(usize, u16)]) -> u64 {
     now
 }
 
+/// Whether the kernel is asked about view memory the guards already hold
+/// (`VICTORY_VIEW_ASK=0`: ask it anyway, as before; A/B-able by that name).
+///
+/// A view is never write-watched: `GetWriteWatch` over one can only fail, and
+/// under Wine a failed call takes the process-wide lock that every change of
+/// mapping holds (0.4 ms beside threads mapping views, 0.5 alone; the
+/// reference fork measured 4,950 failed calls and 2,288 ms a frame of texture
+/// refreshes while the world loaded under Proton). The guards hold such a
+/// range read-only ([`PROTECTED`]; with renderer port #6 [`VIEWS`] knows it
+/// too): a texture's refresh, which asks first without the guards, is answered
+/// "not write-watched" at once, as the failed call would be, and the guarded
+/// asking after it is unchanged.
+fn view_ask() -> bool {
+    #[cfg(test)]
+    if !VIEW_ASK_IN_TEST.get() {
+        return false;
+    }
+    crate::toggled!("VICTORY_VIEW_ASK")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`view_ask`] in tests (false: ask the kernel, as `VICTORY_VIEW_ASK=0`).
+    static VIEW_ASK_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// A kernel asking left out because the guards hold the range's memory as
+/// view memory ([`view_ask`]): counted since the last frame line, and in
+/// renderer port #6's when that is on.
+fn skipped_ask() {
+    if port_guard() {
+        port6_count(P6_NOT_ASKED, 1);
+    }
+    #[cfg(feature = "diagnostics")]
+    tally(13, 1);
+}
+
 /// Whether the kernel would refuse to ask about `[start, end)` for its view
-/// memory (renderer port #6): read-only by our hand, or known a view
-/// ([`VIEWS`]). Such a range is left to [`writes`], which goes to the guards
-/// at once; asked with others it failed their asking too, which was then
-/// asked again by halves.
+/// memory: read-only by our hand, or known a view ([`VIEWS`]). Such a range
+/// is left to [`writes`], which goes to the guards at once; asked with others
+/// it failed their asking too, which was then asked again by halves.
 fn refused_as_view(start: usize, end: usize) -> bool {
-    if !port_guard() || !light() {
+    if !view_ask() || !light() {
         return false;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let refused = PROTECTED.any(first, last) || VIEWS.any(first, last);
     if refused {
-        port6_count(P6_NOT_ASKED, 1);
+        skipped_ask();
     }
     refused
 }
@@ -1274,9 +1319,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         return Some(fresh());
     }
-    // Renderer port #6: view memory, which the kernel would refuse, and the
+    // View memory the guards hold, which the kernel would refuse, and the
     // caller does not ask the guards (textures, which then guard by a way of
-    // their own): no kernel call, ~300 a frame (run guard-2).
+    // their own): "not write-watched" with no kernel call (VICTORY_VIEW_ASK).
+    // Under Wine a failed one takes the lock every change of mapping holds:
+    // 4,950 a frame, 2,288 ms of refreshes, while the world loaded (the
+    // reference fork's run under Proton).
     if !guarded && refused_as_view(start, end) {
         return None;
     }
@@ -1292,7 +1340,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let protected = guarded && light() && PROTECTED.any(first, last);
     let viewed = guarded && !protected && known_views(first, last);
     if viewed {
-        port6_count(P6_NOT_ASKED, 1);
+        skipped_ask();
     }
     let refused = protected || viewed;
     let pages = match if refused { None } else { kernel_written(first, last) } {
@@ -1483,8 +1531,9 @@ pub(crate) fn light() -> bool {
 /// is, written, told so at the next asking), so no two wait for each other.
 ///
 /// Also with the switch:
-/// - view memory is not asked of the kernel, which refuses it
-///   ([`VIEWS`]; ~300 refused askings a frame);
+/// - view memory is not asked of the kernel, which refuses it ([`VIEWS`];
+///   ~300 refused askings a frame). Without the port it is known by
+///   [`PROTECTED`] instead, and not asked either (see [`view_ask`]);
 /// - the planning of a submission's refreshes is made beside the submitting
 ///   thread ([`port_guard_plan`]);
 /// - only if asked for (`VICTORY_GUARD_HOT=<ms>`, [`hot_rest`]): a block the
@@ -1635,18 +1684,19 @@ pub(crate) fn port_guard_line(frames: f64) {
     );
 }
 
-/// The blocks known to be view memory (renderer port #6): guarded by us
-/// once, or found a view by [`guard`]. The kernel refuses to ask about them
-/// (its write watch is not kept for views), and with the switch such a
-/// range goes to the guards at once. Forgotten when the memory is unmapped
-/// or freed; a block wrongly here is only looked at by the guards, which
-/// find it no view ([`is_view`]) and say the range is not watched.
+/// The blocks known to be view memory (renderer port #6; without the port
+/// the guards' [`PROTECTED`] bits are what [`refused_as_view`] goes by):
+/// guarded by us once, or found a view by [`guard`]. The kernel refuses to
+/// ask about them (its write watch is not kept for views), and such a range
+/// goes to the guards at once. Forgotten when the memory is unmapped or
+/// freed; a block wrongly here is only looked at by the guards, which find it
+/// no view ([`is_view`]) and say the range is not watched.
 static VIEWS: Bits = Bits::new();
 
 /// Whether a block of `[first, last)` is known view memory and the kernel
-/// need not be asked ([`VIEWS`]).
+/// need not be asked ([`VIEWS`]; `VICTORY_VIEW_ASK=0` asks it as before).
 fn known_views(first: usize, last: usize) -> bool {
-    port_guard() && light() && VIEWS.any(first, last)
+    view_ask() && light() && VIEWS.any(first, last)
 }
 
 /// A bit per block of the address space, in pieces made when first needed
@@ -2151,9 +2201,10 @@ fn published(start: usize, end: usize) -> bool {
 /// opened by ourselves; nanoseconds waiting for the guards' lock and
 /// nanoseconds of changing protections (all threads); questions to Windows
 /// about holes; kernel askings refused; nanoseconds in kernel askings; the
-/// 4 KiB pages they found written.
+/// 4 KiB pages they found written; kernel askings left out because the
+/// guards hold the range's memory as view memory ([`view_ask`]).
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static ASKS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
@@ -4827,6 +4878,45 @@ mod tests {
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A texture's refresh asks the write watch first without the guards
+    /// ([`writes`], `guarded` false). In view memory the guards hold that is
+    /// "not write-watched" with no kernel asking: the kernel can only refuse
+    /// it, and under Wine a refused asking takes the lock every change of
+    /// mapping holds (the reference fork measured 4,950 a frame and 2,288 ms
+    /// of texture refreshes while the world loaded under Proton). The guarded
+    /// asking after it is unchanged. `VICTORY_VIEW_ASK=0` asks as before.
+    #[test]
+    fn view_memory_the_guards_hold_is_not_asked_of_the_kernel() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        let asks = || KERNEL_ASKS.with(|n| n.get());
+        // The first check learns that it is a view and guards it.
+        let (first, taken) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert_eq!(taken, [(pages(0), first), (pages(1), first)]);
+        let before = asks();
+        // A texture's refresh: not write-watched, and no kernel asking.
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        let (_, unwritten) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert!(unwritten.iter().all(|&(_, w)| w <= first));
+        assert_eq!(asks(), before, "the kernel was asked about a guarded view");
+        // One of the two blocks opened by a write through the other view: the
+        // range is still known to be a view, and the guarded asking reports
+        // the block written, without a kernel asking.
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        let (now, written) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert_eq!(written, [(pages(0), first), (pages(1), now)]);
+        assert_eq!(asks(), before);
+        // The switch asks the kernel as before: one failed asking.
+        VIEW_ASK_IN_TEST.with(|ask| ask.set(false));
+        assert!(writes(guarded, guarded + SIZE, false).is_none());
+        VIEW_ASK_IN_TEST.with(|ask| ask.set(true));
+        assert_eq!(asks(), before + 1, "VICTORY_VIEW_ASK=0 must ask the kernel");
         drop_views(section, &[guarded, other], SIZE);
     }
 
