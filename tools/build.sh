@@ -2,10 +2,14 @@
 # Builds this fork's Windows binary, and answers what a commit must pass
 # before it is one (`tools/build.sh gate`).
 #
-#   tools/build.sh fast      the diag binary the runs use (default). DXC is
-#                            found or fetched (`tools/dxc.sh`); without it
-#                            Wine cannot compile the helper shaders at run
-#                            time and the world's indirect records drop.
+# This tree carries no DXC bundling step: crates/victory-gpu/build.rs has no
+# `VICTORY_BUILD_DXC`, and dxil.rs only has `on_wine()`. The helper shaders
+# therefore compile at run time against a native `d3dcompiler_47.dll` staged
+# beside the exe (`tools/d3dcompiler.sh`). A tree with commit b52f4e3 bundles
+# them as DXIL, and then `tools/build.sh` looks up or fetches DXC
+# (`tools/dxc.sh`) and passes it to the build.
+#
+#   tools/build.sh fast      the diag binary the runs use (default).
 #   tools/build.sh debug     an unoptimized dev build with full debuginfo,
 #                            for a debugger or a backtrace.
 #   tools/build.sh test      compiles the tests for the Windows target (the
@@ -22,23 +26,50 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
-TARGET=${CARGO_TARGET_DIR:-$HOME/.cache/main-target}
+TARGET=${CARGO_TARGET_DIR:-$ROOT/target}
 MODE=${1:-fast}
 
-# The compiler of the helper shaders, found or fetched.
-source tools/dxc.sh
-if ! DXC=$(find_dxc); then
-    if fetch_dxc; then
-        DXC=$(find_dxc)
+source tools/d3dcompiler.sh
+
+# This tree's build.rs has no DXC step; a tree with commit b52f4e3 names
+# `VICTORY_BUILD_DXC` in it and gets the compiler looked up or fetched.
+bundling_supported() {
+    grep -q "VICTORY_BUILD_DXC" "$ROOT/crates/victory-gpu/build.rs" 2>/dev/null
+}
+
+DXC=
+if bundling_supported; then
+    source tools/dxc.sh
+    if ! DXC=$(find_dxc); then
+        if fetch_dxc; then
+            DXC=$(find_dxc)
+        fi
     fi
-fi
-if [ -n "${DXC:-}" ]; then
-    echo "dxc: $DXC (the helpers go into the exe as DXIL)"
+    if [ -n "${DXC:-}" ]; then
+        echo "dxc: $DXC (the helpers go into the exe as DXIL)"
+    else
+        echo "dxc: none — the helpers will not be bundled; fetch one (retry) or $DXC_LINUX" >&2
+    fi
 else
-    echo "dxc: none — Wine cannot compile the helpers at run time; the world's indirect records drop" >&2
-    echo "     fetch one: tools/build.sh fast (retry after the download), or" >&2
-    echo "     $DXC_LINUX" >&2
+    echo "dxc: unused — this tree has no DXIL bundling step; helpers compile at run time"
 fi
+
+report_helpers() {
+    local exe=$1
+    if dxil_bundled "$exe"; then
+        echo "helpers: bundled DXIL in the exe (victory-dxil-bundled)"
+        return
+    fi
+    if d3dcompiler_native "$exe"; then
+        echo "helpers: compiled at run time by the native d3dcompiler_47 beside the exe"
+        return
+    fi
+    echo "helpers: not bundled — $exe carries no victory-dxil-bundled marker" >&2
+    echo "         the helper shaders compile at run time: stage a native" >&2
+    echo "         d3dcompiler_47.dll beside the exe with tools/d3dcompiler.sh" >&2
+    echo "         (ensure_d3dcompiler_47 <exe>), or restore the DXC bundling" >&2
+    echo "         commit b52f4e3 and rebuild (tools/build.sh finds dxc again)" >&2
+}
 
 CARGO="cargo xwin"
 run_cargo() {
@@ -55,16 +86,14 @@ case $MODE in
 fast)
     run_cargo build --profile diag -p victory --features diagnostics
     exe=$TARGET/x86_64-pc-windows-msvc/diag/victory.exe
-    if dxil_bundled "$exe"; then
-        echo "helpers: bundled DXIL in the exe"
-    else
-        echo "helpers: none in the exe — fetch dxc and build again (tools/dxc.sh)" >&2
-    fi
+    report_helpers "$exe"
     echo "exe: $exe"
     ;;
 debug)
     run_cargo build -p victory --features diagnostics
-    echo "exe: $TARGET/x86_64-pc-windows-msvc/debug/victory.exe"
+    exe=$TARGET/x86_64-pc-windows-msvc/debug/victory.exe
+    report_helpers "$exe"
+    echo "exe: $exe"
     ;;
 test)
     run_cargo test -p victory-gpu --features diagnostics --no-run

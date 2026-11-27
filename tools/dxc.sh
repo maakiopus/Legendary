@@ -1,9 +1,11 @@
-# The DXC that compiles the helper shaders of ours at build time
-# (`VICTORY_BUILD_DXC` in build.rs; `dxil.rs` carries them as DXIL in the
-# exe when there was one). Wine's d3dcompiler_47 (vkd3d-shader) refuses the
-# byte-address intrinsics of the card compare, the up check and the
-# argument clamps (E5005), so without a bundled DXIL the world's indirect
-# records drop (`tools/d3dcompiler.sh` says the rest).
+# The DXC that compiles the helper shaders of ours at build time in a tree
+# with the bundling step (commit b52f4e3: `VICTORY_BUILD_DXC` in build.rs;
+# `dxil.rs` carries them as DXIL in the exe when there was one). This tree
+# excludes that commit, so find_dxc/fetch_dxc only matter if it is restored.
+# Wine's d3dcompiler_47 (vkd3d-shader) refuses the byte-address intrinsics of
+# the card compare, the up check and the argument clamps (E5005); without a
+# bundled DXIL a native Microsoft dll beside the exe compiles them instead
+# (`tools/d3dcompiler.sh` says the rest).
 
 # Microsoft's release this fork's dxc is from: 1.9.2609. The Linux asset is
 # what a build here runs; the Windows zip is the reference the release names.

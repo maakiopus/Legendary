@@ -30,10 +30,10 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 EXE=${VICTORY_EXE:-$ROOT/target/x86_64-pc-windows-msvc/diag/victory.exe}
-# The helpers (card compare, up check, argument clamps) only DXC compiles:
-# without them the world's indirect records drop (`tools/d3dcompiler.sh`).
+# The helpers (card compare, up check, argument clamps) only DXC or a native
+# Microsoft d3dcompiler_47 compiles: without them the world's indirect
+# records drop (`tools/d3dcompiler.sh`).
 source "$ROOT/tools/d3dcompiler.sh"
-source "$ROOT/tools/dxc.sh"
 CONSOLE=${VICTORY_CONSOLE:-series-x}
 PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental}
 LOG_DIR=${VICTORY_LOG_DIR:-$HOME/victory-logs}
@@ -90,12 +90,10 @@ if [ ! -f "$EXE" ]; then
     echo "linux-run: no exe at $EXE (tools/build.sh fast builds it)" >&2
     exit 2
 fi
-DXC=$(find_dxc || true)
-echo "dxc: ${DXC:-none} (the build bundles the helpers with it; tools/build.sh fast does)"
 if dxil_bundled "$EXE"; then
-    echo "helpers: bundled DXIL in the exe"
+    echo "helpers: bundled DXIL in the exe (victory-dxil-bundled)"
 else
-    echo "helpers: none in the exe — a native d3dcompiler_47 beside it answers the run-time compile" >&2
+    echo "helpers: compiled at run time — the exe carries no bundled DXIL" >&2
     if ensure_d3dcompiler_47 "$EXE"; then
         # Wine prefers a native dll under the override; the run's umu-run
         # environment carries it.
