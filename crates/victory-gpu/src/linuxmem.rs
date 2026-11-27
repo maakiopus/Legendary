@@ -627,12 +627,12 @@ fn write_watch_works(library: &Library) -> bool {
 /// its reset flag do, by the same kernel call Wine makes for them, without
 /// Wine). `None`: the range is not all write-watched memory
 /// (`MEM_WRITE_WATCH` reservations, which Wine registers with userfaultfd),
-/// and nothing was reset; or [`native_scan`] is off. A failure after its
-/// chunks have reset some runs returns those runs (`Some`) rather than
+/// and normally nothing was reset; or [`native_scan`] is off. A failure after
+/// its chunks have reset some runs returns those runs (`Some`) rather than
 /// `None`, so the completed chunks are not thrown away. (A reset ioctl that
 /// fails after its own pre-check can still leave pages of that chunk reset
-/// but unknown; the caller cannot tell a partial answer from a full one, and
-/// the switch is off by default.)
+/// but unknown; this covers a first chunk too, where the answer is `None`,
+/// and the caller cannot tell a partial `Some` from a full one.)
 ///
 /// Unlike `GetWriteWatch` a range over several write-watched reservations
 /// that follow one another is answered. A range must be asked this way or
