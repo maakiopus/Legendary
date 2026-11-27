@@ -70,6 +70,14 @@
 *.7z
 *.rar
 
+# Python bytecode (the sweep's analyzer is run, not imported from a build)
+__pycache__/
+*.pyc
+
+# Proton writes its shader cache beside the working directory
+/vkd3d-proton.cache
+/vkd3d-proton.cache.write
+
 # Editor / OS noise
 .vs/
 .idea/

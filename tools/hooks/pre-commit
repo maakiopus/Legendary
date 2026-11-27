@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# The pre-commit gate (`tools/gates.sh`, mirrored by CI's clippy and test
+# jobs): a commit does not go in past it. Install once with
+#
+#   git config core.hooksPath tools/hooks
+#
+# and every commit runs `tools/build.sh gate` first. `--no-verify` steps
+# over it — for a merge commit or a docs-only change, not for code.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+
+# Docs and packaging only: the gate compiles, which is slow for nothing.
+if git -C "$ROOT" diff --cached --name-only | grep -qvE '\.(md|txt|log|patch|toml|yml|yaml|json|png|bat|sh|bt)$|^docs/|^linux/|^tools/'; then
+    exec "$ROOT/tools/build.sh" gate
+fi
+echo "docs-only change: the gate is skipped (tools/build.sh gate runs it by hand)"
