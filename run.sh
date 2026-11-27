@@ -4,6 +4,8 @@
 #   ./run.sh <game.exe> [victory run arguments]
 #
 # Best effort, never fatal:
+#   - builds the diag victory.exe with tools/build.sh fast (RUN_BUILD_GAME=0
+#     skips);
 #   - builds and installs the patched GE-Proton package with makepkg when it
 #     is not installed and sudo is passwordless (RUN_BUILD_WINE=0 skips);
 #   - builds linux/thp/victory-thp-collapse and gives it cap_sys_nice when it
@@ -49,6 +51,12 @@ if [ -z "${PROTONPATH:-}" ]; then
     elif [ -d "$GEVT" ]; then
         export PROTONPATH=$GEVT
     fi
+fi
+
+if [ "$DRY" = 0 ] && [ "${RUN_BUILD_GAME:-1}" = 1 ]; then
+    echo "run: building the diag victory.exe (RUN_BUILD_GAME=0 skips)" >&2
+    "$ROOT/tools/build.sh" fast ||
+        echo "run: build failed; the existing exe is used" >&2
 fi
 
 HELPER=$ROOT/linux/thp/victory-thp-collapse
