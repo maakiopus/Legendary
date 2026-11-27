@@ -862,8 +862,8 @@ fn note_shared(written: &[(usize, u16)]) -> u64 {
 /// asking after it is unchanged.
 fn view_ask() -> bool {
     #[cfg(test)]
-    if !VIEW_ASK_IN_TEST.get() {
-        return false;
+    if let Some(ask) = VIEW_ASK_IN_TEST.get() {
+        return ask;
     }
     // Off by default: skipping the kernel's answer crashed the title in two
     // Proton runs (Breakpad, exit 99) where the same binary with the skip
@@ -873,8 +873,10 @@ fn view_ask() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// [`view_ask`] in tests (false: ask the kernel, as `VICTORY_VIEW_ASK=0`).
-    static VIEW_ASK_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// [`view_ask`] in tests: `Some` decides it (`true` the skip is on, the
+    /// skip tests want; `false` asks the kernel, as `VICTORY_VIEW_ASK=0`),
+    /// `None` follows the environment as a run does (off by default).
+    static VIEW_ASK_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// A kernel asking left out because the guards hold the range's memory as
@@ -4897,6 +4899,9 @@ mod tests {
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         let asks = || KERNEL_ASKS.with(|n| n.get());
+        // The skip is off by default (it crashed the title in two Proton
+        // runs, [`view_ask`]); the test turns it on: its subject is the skip.
+        VIEW_ASK_IN_TEST.with(|ask| ask.set(Some(true)));
         // The first check learns that it is a view and guards it.
         let (first, taken) = writes(guarded, guarded + SIZE, true).expect("a view");
         assert_eq!(taken, [(pages(0), first), (pages(1), first)]);
@@ -4916,9 +4921,9 @@ mod tests {
         assert_eq!(written, [(pages(0), first), (pages(1), now)]);
         assert_eq!(asks(), before);
         // The switch asks the kernel as before: one failed asking.
-        VIEW_ASK_IN_TEST.with(|ask| ask.set(false));
+        VIEW_ASK_IN_TEST.with(|ask| ask.set(Some(false)));
         assert!(writes(guarded, guarded + SIZE, false).is_none());
-        VIEW_ASK_IN_TEST.with(|ask| ask.set(true));
+        VIEW_ASK_IN_TEST.with(|ask| ask.set(None));
         assert_eq!(asks(), before + 1, "VICTORY_VIEW_ASK=0 must ask the kernel");
         drop_views(section, &[guarded, other], SIZE);
     }
