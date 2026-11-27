@@ -3503,7 +3503,42 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    mapping: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+    /// Ranges [`Remapping::remapped_later`] was told of, still to tell
+    /// [`title_memory_remapped`] of ([`Remapping::drop`]).
+    later: Vec<(usize, usize)>,
+}
+
+impl Remapping {
+    /// Title memory `[at, at + len)` is there, but telling the rest of that
+    /// ([`title_memory_remapped`]) is left until the change is done and
+    /// the mapping lock is let go, in [`Remapping::drop`] and joined with what was
+    /// noted before it.
+    ///
+    /// For runs of private pages (`xmem.rs` `private_backing`, renderer port
+    /// #1 under Wine): no view of a section shows them, so no
+    /// [`title_memory_view`] must follow, and they are committed read-write
+    /// the moment the system call returns: a read can meet no page that is
+    /// not there. What is left to tell — the absent cache, textures'
+    /// tickets, what port 1 had in place over the address (the
+    /// [`title_memory_unmapping`] of the view it replaces already told
+    /// that), and the guards, which held no block of a placeholder — may
+    /// wait until no reader of title memory queues behind this thread.
+    /// Under Wine the lock is held for the system call (the stock
+    /// wineserver's view-tree walk), and this keeps our own work off the
+    /// end of it.
+    ///
+    /// A view must not use this: [`title_memory_view`] has to follow
+    /// [`title_memory_remapped`] of its range inside the change, and the
+    /// guards' view of a page must be told before a write through it can
+    /// happen.
+    pub fn remapped_later(&mut self, at: usize, len: usize) {
+        if len != 0 {
+            self.later.push((at, len));
+        }
+    }
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3512,6 +3547,24 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The lock goes before the telling: it was held for the change, and
+        // whoever reads title memory in place queues at it.
+        drop(self.mapping.take());
+        if self.later.is_empty() {
+            return;
+        }
+        let mut later = std::mem::take(&mut self.later);
+        later.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(later.len());
+        for (at, len) in later {
+            match merged.last_mut() {
+                Some((_, last)) if at <= *last => *last = (*last).max(at.saturating_add(len)),
+                _ => merged.push((at, at.saturating_add(len))),
+            }
+        }
+        for (at, end) in merged {
+            title_memory_remapped(at, end.saturating_sub(at));
+        }
     }
 }
 
@@ -3663,7 +3716,7 @@ pub fn title_memory_remapping() -> Remapping {
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping { mapping: Some(changing), later: Vec::new() }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
