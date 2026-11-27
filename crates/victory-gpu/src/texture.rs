@@ -126,6 +126,24 @@ fn hot_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
 }
 
+impl Last {
+    /// Whether `hash` differs from the one the staging buffer was detiled
+    /// from; keeps it. `blind`: the check rests on the hash alone (the
+    /// guard saw no write), so a change keeps it hashed at every check for
+    /// a while ([`HOT_FRAMES`]); a change the guard saw, or a check that
+    /// finds no change, leaves the window alone.
+    fn changed(&mut self, hash: Digest, blind: bool) -> bool {
+        let changed = self.hash != Some(hash);
+        self.hash = Some(hash);
+        if blind && changed && hot_textures() {
+            self.hot_until = crate::frame::current() + HOT_FRAMES;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHot, 1);
+        }
+        changed
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -1262,7 +1280,8 @@ impl Staging {
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
         // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // texture's address, so the textures take turns, and at every
+        // check for a while once a hash found such a write ([`HOT_FRAMES`]).
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
@@ -1289,14 +1308,6 @@ impl Staging {
             }
             blind = unwritten;
         }
-        // A change the guard did not see: hashed at every check for a while.
-        let found_blind = |last: &mut Last| {
-            if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHot, 1);
-            }
-        };
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1308,7 +1319,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, blind);
             };
             mapped
         } else {
@@ -1331,11 +1342,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
+                if !last.changed(digest(read), blind) {
                     return false;
                 }
-                last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1346,21 +1355,16 @@ impl Staging {
             if changed {
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
             }
-            if changed {
-                found_blind(last);
-            }
+            let _ = changed;
             return size;
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.changed(digest(tiled), blind) {
                     return size;
                 }
-                last.hash = Some(hash);
-                found_blind(last);
                 self.detile(tiled);
                 self.keep_whole(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1371,14 +1375,11 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.changed(digest(tiled), blind) {
             return size;
         }
-        last.hash = Some(hash);
-        found_blind(last);
         self.detile(tiled);
         self.keep_whole(tiled);
         #[cfg(feature = "diagnostics")]
@@ -1392,16 +1393,15 @@ impl Staging {
     /// before keeps what it holds and the texture is looked at again at its
     /// next refresh (what was learnt about writes to it is forgotten, so
     /// that it is not passed over as unwritten); one never filled takes the
-    /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    /// pages that are there ([`Staging::fill`]). `blind` as in
+    /// [`Last::changed`]. Returns the bytes read.
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, blind: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = digest(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
+            if last.changed(digest(read), blind) {
                 self.detile(read);
                 self.keep_whole(read);
             }
@@ -2050,6 +2050,46 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hot_tests {
+    use super::{HOT_FRAMES, Last, digest, hot_textures};
+
+    /// A change the hash alone finds keeps the texture hashed at every
+    /// check for a while ([`HOT_FRAMES`]); a change the guard saw, and a
+    /// check that finds no change, leave the window alone.
+    #[test]
+    fn only_a_change_the_guard_missed_extends_the_hot_window() {
+        let (a, b) = (digest(b"frame 1"), digest(b"frame 2"));
+        let mut last = Last::default();
+        let before = crate::frame::current();
+        assert!(last.changed(a, false));
+        assert_eq!(last.hot_until, 0);
+        assert!(!last.changed(a, true));
+        assert_eq!(last.hot_until, 0);
+        assert!(last.changed(b, true));
+        let after = crate::frame::current();
+        if hot_textures() {
+            assert!(last.hot_until >= before + HOT_FRAMES, "hashed for a while");
+            assert!(last.hot_until <= after + HOT_FRAMES, "from this check");
+        } else {
+            // `VICTORY_TEXTURE_HOT=0`: every eighth frame only, as before.
+            assert_eq!(last.hot_until, 0);
+        }
+        let window = last.hot_until;
+        assert!(last.changed(a, false));
+        assert_eq!(last.hot_until, window, "a change the guard saw leaves it");
+        assert!(!last.changed(a, true));
+        assert_eq!(
+            last.hot_until, window,
+            "a check finding no change leaves it"
+        );
+        assert!(last.changed(b, true));
+        let window = last.hot_until;
+        assert!(!last.changed(b, true));
+        assert_eq!(last.hot_until, window);
     }
 }
 
