@@ -273,7 +273,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     *allocated = Some(arrays.map(|p| p as usize));
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
-    xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    xma.voices = (0..counts[4]).map(|_| Slot::new()).collect();
     S_OK
 }
 
@@ -337,11 +337,6 @@ struct Trace {
     since: Instant,
     /// Samples per channel written to the ring.
     produced: usize,
-    /// Blocks the title took (command 18), how often, and how often it
-    /// found the ring less than full.
-    taken: usize,
-    takes: u32,
-    partial_takes: u32,
     frames: u32,
     bad_frames: u32,
     /// The loudest sample written.
@@ -350,13 +345,44 @@ struct Trace {
     ended_ms: Option<u128>,
 }
 
+/// Blocks the title took (command 18), how often, and how often it found
+/// the ring less than full, for the debug log when a voice is disabled.
+#[derive(Default)]
+struct Takes {
+    taken: usize,
+    takes: u32,
+    partial_takes: u32,
+}
+
+/// One context's state on our side. Each has its own locks, so a command
+/// for one voice never waits for others to decode (the title sends them
+/// from its time-critical mixer thread).
+struct Slot {
+    /// `Some` while enabled. The decoding thread holds it for one block at
+    /// a time (the frames that block needs); enabling and disabling take
+    /// it too.
+    voice: Mutex<Option<Voice>>,
+    /// Held to move the ring's read block or "writable" in the context,
+    /// which the decoding thread and the read-advance command both change,
+    /// and never while decoding: the title's mixer never waits for a
+    /// decode. Taken after `voice` when both are.
+    ring: Mutex<Takes>,
+}
+
+impl Slot {
+    fn new() -> Slot {
+        Slot {
+            voice: Mutex::new(None),
+            ring: Mutex::new(Takes::default()),
+        }
+    }
+}
+
 struct Xma {
     /// Host address of the context array.
     array: usize,
-    /// One entry per context, `Some` while enabled. Each has its own lock,
-    /// so a command for one voice never waits for others to decode (the
-    /// title sends them from its time-critical mixer thread).
-    voices: Vec<Mutex<Option<Voice>>>,
+    /// One entry per context.
+    voices: Vec<Slot>,
 }
 
 impl Xma {
@@ -413,7 +439,8 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let mut slot = lock(&self.voices[index as usize]);
+        let slot = &self.voices[index as usize];
+        let mut voice = lock(&slot.voice);
         context.set_field(2, 26, 6, 0);
         tracing::debug!(
             index,
@@ -422,7 +449,7 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        *slot = Some(Voice {
+        *voice = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
@@ -430,16 +457,14 @@ impl Xma {
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
                 frames: 0,
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
             },
         });
-        drop(slot);
+        *lock(&slot.ring) = Takes::default();
+        drop(voice);
         wake_decoder();
     }
 
@@ -447,17 +472,20 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let slot = &self.voices[index as usize];
+        let mut voice = lock(&slot.voice);
+        let Some(voice) = voice.take() else {
             return;
         };
+        let takes = std::mem::take(&mut *lock(&slot.ring));
         let t = &voice.trace;
         tracing::debug!(
             index,
             ms = t.since.elapsed().as_millis(),
             produced = t.produced,
-            taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
-            takes = t.takes,
-            partial_takes = t.partial_takes,
+            taken = takes.taken * SAMPLES_PER_BLOCK / context.channels(),
+            takes = takes.takes,
+            partial_takes = takes.partial_takes,
             frames = t.frames,
             bad_frames = t.bad_frames,
             peak = t.peak,
@@ -473,8 +501,9 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        // The decoder writes the same words.
-        let mut slot = lock(&self.voices[index as usize]);
+        // The decoding thread writes the same words; it holds this lock
+        // only to do so, never while it decodes.
+        let mut takes = lock(&self.voices[index as usize].ring);
         let size = context.field(0, 22, 5).max(1);
         // The count is the title's: reduced first, so the sum stays small.
         let read = (context.field(9, 0, 5) + blocks % size) % size;
@@ -482,13 +511,10 @@ impl Xma {
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
         }
-        if let Some(voice) = &mut *slot {
-            let t = &mut voice.trace;
-            t.taken += blocks as usize;
-            t.takes += 1;
-            t.partial_takes += u32::from(blocks < size);
-        }
-        drop(slot);
+        takes.taken += blocks as usize;
+        takes.takes += 1;
+        takes.partial_takes += u32::from(blocks < size);
+        drop(takes);
         wake_decoder();
     }
 
@@ -497,11 +523,8 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+            if let Some(context) = self.context(index) {
+                active += u32::from(pump(context, &self.voices[index as usize]));
             }
         }
         let took = start.elapsed();
@@ -511,53 +534,80 @@ impl Xma {
     }
 }
 
-fn pump(context: Context, voice: &mut Voice) {
-    let size = context.field(0, 22, 5);
-    if size == 0 {
-        return;
-    }
-    while context.field(1, 31, 1) == 1 {
-        if xma_refill() {
-            // (codec-d/cool_fox fabb872a, `VICTORY_XMA_REFILL=1`.) A skipped
-            // frame or an input boundary can advance the decoder without
-            // producing samples: only whole blocks are published, but for the
-            // padded tail at the end, and at most 8 empty steps are taken so
-            // a broken looping voice holds neither its lock nor other voices.
-            for _ in 0..8 {
-                if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
-                    break;
-                }
-            }
-            if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
-                return;
-            }
-        } else if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
-        }
-        // The write block is the title's too: taken modulo the ring before
-        // the first write, which would otherwise land past the ring's end.
-        let write = context.field(0, 27, 5) % size;
-        let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
-            return;
+/// Fills a context's output as far as it has room; false if it is not
+/// enabled. The voice's lock is held for one block at a time, so enabling
+/// or disabling it waits for that block's decoding at most.
+fn pump(context: Context, slot: &Slot) -> bool {
+    let mut enabled = false;
+    loop {
+        let mut voice = lock(&slot.voice);
+        let Some(voice) = voice.as_mut() else {
+            return enabled;
         };
-        for pair in out.as_chunks_mut::<2>().0 {
-            let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
-            pair.copy_from_slice(&sample.to_le_bytes());
-        }
-        voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
-        let write = (write + 1) % size;
-        context.set_field(0, 27, 5, write);
-        // The read block is the title's: taken modulo the ring like the
-        // write block and `advance_read`'s. Compared as it is, one at or
-        // past the end would never be met, and a stream that loops would
-        // keep this voice (and its lock) filling forever.
-        if write == context.field(9, 0, 5) % size {
-            // Full: nothing more until the title advances its read block.
-            context.set_field(1, 31, 1, 0);
+        enabled = true;
+        if !fill_block(context, voice, &slot.ring) {
+            return true;
         }
     }
+}
+
+/// Decodes what the next output block needs and writes it, if the ring has
+/// room; false when it has none or there is nothing more to write. The
+/// caller holds the voice's lock.
+fn fill_block(context: Context, voice: &mut Voice, ring: &Mutex<Takes>) -> bool {
+    let size = context.field(0, 22, 5);
+    // "Writable" is read without the ring lock: only this clears it, under
+    // the voice's lock, and the title's read-advance only sets it.
+    if size == 0 || context.field(1, 31, 1) == 0 {
+        return false;
+    }
+    if xma_refill() {
+        // (codec-d/cool_fox fabb872a, `VICTORY_XMA_REFILL=1`.) A skipped
+        // frame or an input boundary can advance the decoder without
+        // producing samples: only whole blocks are published, but for the
+        // padded tail at the end, and at most 8 empty steps are taken so
+        // a broken looping voice holds neither its lock nor other voices.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
+            return false;
+        }
+    } else if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        return false;
+    }
+    // The write block is the title's too: taken modulo the ring before the
+    // first write, which would otherwise land past the ring's end.
+    let write = context.field(0, 27, 5) % size;
+    let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
+    let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        return false;
+    };
+    for pair in out.as_chunks_mut::<2>().0 {
+        let sample = voice.pcm.pop_front().unwrap_or(0);
+        voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+        pair.copy_from_slice(&sample.to_le_bytes());
+    }
+    voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
+    let write = (write + 1) % size;
+    // The read block and "writable" are the read-advance command's too.
+    // Taken before the write block moves: a read-advance between the two
+    // could take the block just written, leaving the ring empty with read
+    // at write, and the check below would then mark the empty ring full,
+    // stopping the voice for good.
+    let _ring = lock(ring);
+    context.set_field(0, 27, 5, write);
+    // The read block is the title's: taken modulo the ring like the write
+    // block and `advance_read`'s. Compared as it is, one at or past the end
+    // would never be met, and a stream that loops would keep this voice
+    // filling forever.
+    if write == context.field(9, 0, 5) % size {
+        // Full: nothing more until the title advances its read block.
+        context.set_field(1, 31, 1, 0);
+    }
+    true
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
@@ -704,6 +754,7 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    raise_priority();
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
@@ -714,6 +765,42 @@ fn wake_decoder() {
         })
         .unpark();
 }
+
+/// Has the calling thread, the decoding thread, scheduled like a host
+/// audio engine's: in MMCSS's "Pro Audio" class, else time-critical, else
+/// highest. The title's mixer that takes what it decodes runs
+/// time-critical; at normal priority this thread lost the CPU to bulk
+/// workers (DirectStorage's, one per core) while frames were slow, and
+/// rings of at most 83 ms ran dry. It works only while a ring has room,
+/// so it cannot hog a core.
+#[cfg(windows)]
+fn raise_priority() {
+    use windows_sys::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
+        THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let (name, mut task) = (windows_sys::core::w!("Pro Audio"), 0);
+    // SAFETY: a NUL-terminated task name and an out parameter. The
+    // registration is for the thread's life, which is the process's.
+    let mmcss = unsafe { AvSetMmThreadCharacteristicsW(name, &mut task) };
+    if !mmcss.is_null() {
+        tracing::info!("XMA decoder: MMCSS \"Pro Audio\"");
+        return;
+    }
+    let error = std::io::Error::last_os_error();
+    let priority = [
+        (THREAD_PRIORITY_TIME_CRITICAL, "time-critical"),
+        (THREAD_PRIORITY_HIGHEST, "highest"),
+    ]
+    .into_iter()
+    // SAFETY: changes only this thread's priority.
+    .find(|&(p, _)| unsafe { SetThreadPriority(GetCurrentThread(), p) } != 0)
+    .map_or("normal", |(_, name)| name);
+    tracing::info!(%error, priority, "XMA decoder: no MMCSS");
+}
+
+#[cfg(not(windows))]
+fn raise_priority() {}
 
 /// Runs an XMA command; false for one this does not know.
 fn xma_command(command: u32, word: impl Fn(usize) -> Option<u32>) -> bool {
@@ -1271,7 +1358,7 @@ mod tests {
             }
         }
         // Six frames and the flushed tail: 3,328 samples, 26 blocks.
-        let produced = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.trace.produced);
+        let produced = |x: &Xma| lock(&x.voices[1].voice).as_ref().map(|v| v.trace.produced);
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
@@ -1289,6 +1376,80 @@ mod tests {
         ApuFree(input);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// The read-advance command, which the title sends from its
+    /// time-critical mixer, does not wait for a decode in progress, which
+    /// holds the voice's lock: it used to, for as long as the decoding
+    /// thread took to fill the whole ring.
+    #[test]
+    fn read_advance_does_not_wait_for_decoding() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        // SAFETY: the ring was just allocated.
+        unsafe { output.cast::<u8>().write_bytes(0x55, 0x400) };
+
+        // As in `xma_contexts_decode_into_their_output_rings`, but the ring
+        // is full: not writable, the write block on the read block.
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(1, 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        let command = |command: u32, words: [u32; 2]| {
+            assert!(xma_command(command, |at| words.get(at).copied()));
+        };
+        command(ENABLE_XMA, [1, 0]);
+
+        // A decode in progress: the voice's lock held.
+        let voices = xma();
+        let decoding = lock(&voices.voices[1].voice);
+        let (done, advanced) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            command(ADVANCE_XMA_READ, [1, 2]);
+            let _ = done.send(());
+        });
+        let waited = advanced
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err();
+        let (read, writable) = (context.field(9, 0, 5), context.field(1, 31, 1));
+        // The decode ends: blocks 0 and 1 are filled, up to the new read
+        // block.
+        drop(decoding);
+        drop(voices);
+        if waited {
+            assert!(advanced.recv().is_ok());
+        }
+        xma().pump();
+        let (write, full) = (context.field(0, 27, 5), context.field(1, 31, 1) == 0);
+        // SAFETY: the ring.
+        let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x400) }.to_vec();
+
+        command(DISABLE_XMA, [1, 0]);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        assert!(!waited, "the read-advance waited for the decode");
+        assert_eq!((read, writable), (2, 1));
+        assert_eq!((write, full), (2, true));
+        assert!(ring[..0x200].iter().all(|&b| b == 0));
+        assert!(ring[0x200..].iter().all(|&b| b == 0x55));
     }
 
     /// A loop over the first two frames, which ends after the second
@@ -1326,9 +1487,6 @@ mod tests {
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
                 frames: 0,
                 bad_frames: 0,
                 peak: 0,
