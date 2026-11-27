@@ -851,7 +851,7 @@ pub(crate) fn page_written(at: usize, len: usize) {
 }
 
 /// Title textures a shader wrote through unordered access since a texture
-/// pass last took them ([`gpu_written`]), by span of title memory: such a
+/// pass last took them ([`uav_written`]), by span of title memory: such a
 /// write changes memory with no descriptor write and no CPU write the
 /// watch sees, so only the pass's looks find it.
 static UAV_WRITTEN: Mutex<std::collections::BTreeSet<(u64, u64)>> =
@@ -869,25 +869,22 @@ pub(crate) static UAV_RECHECK: [std::sync::atomic::AtomicU64; 5] =
 /// wait their turn.
 const UAV_DUE_A_FRAME: u64 = 32;
 
-/// Whether a title texture written on the GPU (unordered access, or a copy
-/// into it) is looked at again by the texture pass
-/// (`VICTORY_UAV_RECHECK=0`: no; only the 400-frame look of a texture
-/// picked by index finds the write, late).
+/// Whether a title texture a shader writes through unordered access is
+/// looked at again by the texture pass (`VICTORY_UAV_RECHECK=0`: no; only
+/// the 400-frame look of a texture picked by index finds the write, late).
 fn uav_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_RECHECK").is_none_or(|v| v != "0"))
 }
 
-/// Title texture `resource` was written on the GPU, through unordered
-/// access ([`crate::draw::readable`]) or by a copy into it
-/// (`crate::list`): keep the span of title memory its view covers for the
-/// next texture pass, which makes the slots that show it due
-/// ([`HostHeap::texture_slots_uav_written`]), and mark its host copy as
-/// the GPU's (a placed view of that memory is filled from it,
-/// [`crate::resource::alias_of`]). Only a texture whose memory is title
-/// memory itself: a host texture's writes stay on the card and reach no
-/// view the title samples. Locks one mutex, and calls nothing under it.
-pub(crate) fn gpu_written(resource: crate::object::This) {
+/// Title texture `resource` was written by a shader through unordered
+/// access ([`crate::draw::readable`]): keep the span of title memory its
+/// view covers for the next texture pass, which makes the slots that show
+/// it due ([`HostHeap::texture_slots_uav_written`]). Only a texture whose
+/// memory is title memory itself: a host texture's writes stay on the card
+/// and reach no view the title samples. Locks one mutex, and calls nothing
+/// under it.
+pub(crate) fn uav_written(resource: crate::object::This) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
@@ -902,18 +899,12 @@ pub(crate) fn gpu_written(resource: crate::object::This) {
     }
     UAV_RECHECK[0].fetch_add(1, Relaxed);
     let range = (at, at.saturating_add(len));
-    let new = {
-        let mut ranges = UAV_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        if ranges.len() >= MOST && !ranges.contains(&range) {
-            UAV_RECHECK[1].fetch_add(ranges.len() as u64, Relaxed);
-            ranges.clear();
-        }
-        ranges.insert(range)
-    };
-    if new {
-        // Its host copy holds what the GPU wrote; title memory may not.
-        crate::texture::host_written(resource);
+    let mut ranges = UAV_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len() >= MOST && !ranges.contains(&range) {
+        UAV_RECHECK[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
     }
+    ranges.insert(range);
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -2222,7 +2213,7 @@ impl HostHeap {
     }
 
     /// Takes the title textures shaders wrote through unordered access
-    /// since the last call ([`gpu_written`]) and makes the slots that show
+    /// since the last call ([`uav_written`]) and makes the slots that show
     /// their memory due ([`HostHeap::slots_uav_written`]). Returns how many
     /// it made due.
     fn texture_slots_uav_written(&self, frame: u64) -> usize {

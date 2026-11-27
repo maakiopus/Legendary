@@ -644,18 +644,6 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
-/// The resource a host copy or a write through unordered access filled
-/// whose title memory covers `address` ([`host_written`]), if any: a placed
-/// view there is filled from it, not from title memory, which the write
-/// never reached.
-pub(crate) fn host_written_at(address: u64) -> Option<This> {
-    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
-    map.range(..=address)
-        .next_back()
-        .filter(|(at, d)| address < **at + d.0)
-        .map(|(_, d)| d.5 as This)
-}
-
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1604,45 +1592,6 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(len - WINDOW, WINDOW);
         }
     });
-    let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
-}
-
-/// Whether a scheduled look at an uploaded texture reads all of its title
-/// memory, not three 16 KiB probes (`VICTORY_TEXTURE_FULL_RECHECK=0`: the
-/// probes, as before). A square the title writes between the probes left
-/// the probes as they were, so the look found nothing and the slot was
-/// looked at again and again without ever being uploaded.
-pub(crate) fn full_recheck() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FULL_RECHECK").is_none_or(|v| v != "0"))
-}
-
-/// The fingerprint a scheduled look compares: all of `[at, at + len)` when
-/// [`full_recheck`], else the three probes of [`fingerprint`]. Never 0.
-/// Read in 64 KiB pieces, so a large texture takes no larger buffer.
-pub(crate) fn recheck_fingerprint(at: u64, len: u64) -> u64 {
-    if !full_recheck() {
-        return fingerprint(at, len);
-    }
-    const PIECE: usize = 64 << 10;
-    let len = len as usize;
-    let mut print = 0u128;
-    let mut from = 0usize;
-    while from < len {
-        let bytes = (len - from).min(PIECE);
-        with_read(bytes, |read| {
-            read[..bytes].fill(0);
-            crate::host::copy_mapped(
-                read.as_mut_ptr(),
-                (at as usize + from) as *const u8,
-                bytes,
-                false,
-            );
-            print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
-        });
-        from += bytes;
-    }
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
     u64::from_le_bytes(first) | 1
 }

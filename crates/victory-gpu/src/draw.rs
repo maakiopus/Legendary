@@ -733,16 +733,6 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
-/// Bytes of full recheck one frame reads: a look that reads a whole texture
-/// is the work of hashing it, and a scene's first looks are thousands; the
-/// slots over it stay due for the frames after.
-const RECHECK_AT_MOST: u64 = 32 << 20;
-
-/// Full looks at uploaded textures since the start, the bytes they read,
-/// and looks left for a later frame because the frame's bytes were spent
-/// (`VICTORY_TEXTURE_FULL_RECHECK`).
-pub(crate) static HEAP_TEXTURES_FULL_RECHECK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
 /// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
 /// schedule ended (`VICTORY_HEAP_RECHECK_FOREVER=0`: no).
 fn recheck_forever() -> bool {
@@ -790,10 +780,6 @@ fn heap_recheck() -> bool {
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
-/// Slots whose host copy was filled from a texture the host wrote, at the
-/// same memory (a bake's atlas, a shader's unordered access), since the
-/// start: their texels are on the card in that texture, not in title memory.
-pub(crate) static HEAP_TEXTURES_ALIASED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
@@ -2305,12 +2291,9 @@ impl State {
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
-        // Bytes of full recheck this frame has read (`RECHECK_AT_MOST`).
-        static RECHECK_SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
-            RECHECK_SPENT.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -2485,19 +2468,7 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                // A full look reads all of the texture: this frame's bytes
-                // bound how many; the slots over it stay due for a later
-                // pass, which reads them after the next frame begins.
-                if crate::texture::full_recheck() {
-                    if RECHECK_SPENT.load(Ordering::Relaxed) >= RECHECK_AT_MOST {
-                        HEAP_TEXTURES_FULL_RECHECK[2].fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    RECHECK_SPENT.fetch_add(len, Ordering::Relaxed);
-                    HEAP_TEXTURES_FULL_RECHECK[0].fetch_add(1, Ordering::Relaxed);
-                    HEAP_TEXTURES_FULL_RECHECK[1].fetch_add(len, Ordering::Relaxed);
-                }
-                if crate::texture::recheck_fingerprint(at, len) == print {
+                if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2710,15 +2681,6 @@ impl State {
             };
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
-                // A placed view of memory the host wrote (a bake's atlas, a
-                // shader's unordered access): its texels are on the card in
-                // that texture; title memory, which this host copy was
-                // filled from, may not have them. Copy them in.
-                if crate::resource::alias_of(resource)
-                    .is_some_and(|source| crate::texture::alias(list, resource, source))
-                {
-                    HEAP_TEXTURES_ALIASED.fetch_add(1, Ordering::Relaxed);
-                }
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -2735,7 +2697,7 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::recheck_fingerprint(at, len);
+                        let print = crate::texture::fingerprint(at, len);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2860,7 +2822,7 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::recheck_fingerprint(at, len);
+                    let print = crate::texture::fingerprint(at, len);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -4573,7 +4535,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // pass makes the slots that show it due, a few a frame, rather
             // than leaving them to the 400-frame look
             // (`VICTORY_UAV_RECHECK=0`: only the look, as before).
-            crate::descriptor::host::gpu_written(*resource as This);
+            crate::descriptor::host::uav_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

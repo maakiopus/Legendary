@@ -939,7 +939,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
             crate::texture::host_written(dst);
-            crate::descriptor::host::gpu_written(dst);
             if same {
                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1143,7 +1142,6 @@ extern "system" fn copy_texture_region(
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         crate::texture::host_written(dst.resource);
-        crate::descriptor::host::gpu_written(dst.resource);
         if same {
             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
