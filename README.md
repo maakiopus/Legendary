@@ -1,7 +1,35 @@
-# VIctory on an RX 7900 XTX
+# Legendary (Linux Victory Port)
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+**The Linux/Proton port of VIctory**: a compatibility layer that runs an Xbox
+Series title natively from files you supply, here carried under Wine/Proton with
+vkd3d-proton on AMD (RADV) — and still building and running on Windows.
+
+Legendary builds on [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+itself a fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory). The
+Windows sections below are the base fork's record; the Linux side, every fix
+that made Proton work, the measurements and the dead ends are in
+[`LINUX.md`](LINUX.md), [`docs/linux-research.md`](docs/linux-research.md) and
+[`docs/linux-handoff.md`](docs/linux-handoff.md).
+
+## Linux (Proton + vkd3d): where it stands
+
+The title boots, streams and renders its world under **Proton Experimental +
+vkd3d-proton + RADV** on an RX 6700 XT. A fixed 10-minute sweep reaches the world
+(~3 min in), captures 100+ lit frames and passes: no faults, no shader drops, no
+black frames.
+
+What it took: one back edge per loop header for dxil-spirv (the earlier black
+world: pipeline workers overflowed their stack), our helper shaders compiled to
+DXIL at build time with DXC (Wine's `d3dcompiler_47` defines no byte-address
+`Load4`/`Store`/`Interlocked`), the empty pipeline library through the vkd3d ABI,
+scripted keys reaching GameInput, a bounded worker stall, texture guard/queue
+fixes, a draw-time recheck of indexed and UAV-written textures, and `NO_WAIT`
+under Wine.
+
+Build and run: [`LINUX.md`](LINUX.md). Deterministic sweeps:
+[`tools/linux-sweep/`](tools/linux-sweep/README.md). Frame-time breakdown, port
+status, rejected paths and the wineserver view-tree plan:
+[`docs/linux-research.md`](docs/linux-research.md).
 
 ## The goal
 

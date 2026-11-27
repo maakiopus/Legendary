@@ -1,8 +1,10 @@
-# VIctory on Linux (Proton)
+# Legendary on Linux (Proton)
 
-The Windows build runs under Wine/Proton (Proton Experimental, AMD on Mesa/RADV
-tested). This file is the Linux side: what had to change for the layer to run
-there, how to start it, and what is measured.
+**Legendary** is the Linux/Proton port of VIctory. The Windows build runs under
+Wine/Proton (Proton Experimental, AMD on Mesa/RADV tested); this file is the
+Linux side: what had to change for the layer to run there, how to start it, and
+what is measured. The research record is in
+[`docs/linux-research.md`](docs/linux-research.md).
 
 **No game files are in this repository.** You need your own dump of the Xbox
 Series build.
