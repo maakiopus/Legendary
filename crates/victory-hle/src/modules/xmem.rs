@@ -222,6 +222,10 @@ pub struct BasicInformation {
     tag: [u8; 4],
 }
 
+/// Times the title asked [`XMemVirtualQuery`] about a view of its pages
+/// (with [`direct`] Windows' answer gets its kind wrong, and is corrected).
+pub(crate) static QUERIED_VIEWS: AtomicU64 = AtomicU64::new(0);
+
 // shortcut: every committed page reports graphics memory and no tag, since
 // all of it is GPU-reachable here (the title's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
@@ -239,6 +243,25 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        // (LINUXMEM.md S1a) Counted, to know whether a title ever asks
+        // about a view of its pages: one shown by `mremap` (`direct`) is
+        // private memory to the host's eye, and the title is told what
+        // Windows would say of a view.
+        const MEM_PRIVATE: u32 = 0x2_0000;
+        const MEM_MAPPED: u32 = 0x4_0000;
+        if process == GetCurrentProcess()
+            && matches!(info.host.Type, MEM_PRIVATE | MEM_MAPPED)
+            && victory_gpu::title_memory_shown(address as usize, 1)
+        {
+            let direct = info.host.Type == MEM_PRIVATE && direct::on();
+            if direct {
+                info.host.Type = MEM_MAPPED;
+            }
+            let n = QUERIED_VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, address = format_args!("{address:p}"), direct, "title asked XMemVirtualQuery on a view");
+            }
+        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -1860,98 +1883,28 @@ fn split(base: usize, len: usize) {
     });
 }
 
-/// Page mappings under Wine without the wineserver. A view of a section is a
-/// wineserver request to map and one to unmap, and each looks through every
-/// view the process has: in the title's world about 130,000, 0.65 ms a
-/// request, 4.3 s of every 5 s spent in them by the thread that maps, with
-/// sixteen DirectStorage workers waiting behind it. Here the address gets a
-/// committed reservation of its own in place of the placeholder, which Wine
-/// makes without asking the server, and the section's pages are shown there
-/// by `mremap` from the section's whole view ([`Section::window`]), through a
-/// small unix library of ours (`unix/victory_pages.rs`) beside the program:
-/// 8.5 us for the two. Without that library, or with
-/// `VICTORY_DIRECT_PAGES=0`, pages are views as on Windows.
+/// Page mappings under Wine without the wineserver (`VICTORY_DIRECT_PAGES=1`,
+/// off by default; from LloydNicholson 7ed6ca02). A view of a section is a
+/// wineserver request to map and one to unmap, under ntdll's one
+/// address-space lock. Here the address gets a committed reservation of its
+/// own in place of the placeholder, which Wine makes without asking the
+/// server, and the section's pages are shown there by `mremap` from the
+/// section's whole view ([`Section::window`]), through a small unix library
+/// of ours beside the program (`victory_mem.so`, `victory_gpu::linuxmem`).
+/// Without that library, or not under Wine, pages are views as on Windows.
+/// `VICTORY_DIRECT_POPULATE=1`: the pages are faulted in by the same call.
 mod direct {
-    use std::ffi::c_void;
-    use std::sync::LazyLock;
-
-    #[repr(C)]
-    struct Show {
-        from: usize,
-        bytes: usize,
-        at: usize,
-        result: isize,
-    }
-
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        maximum: u16,
-        buffer: *const u16,
-    }
-
-    type Query = unsafe extern "system" fn(isize, *const c_void, i32, *mut c_void, usize, *mut usize) -> i32;
-    type Call = unsafe extern "system" fn(u64, u32, *mut c_void) -> i32;
-    /// `MemoryWineLoadUnixLibByName` (Wine 11).
-    const LOAD_BY_NAME: i32 = 1002;
-
-    static LIBRARY: LazyLock<Option<(u64, Call)>> = LazyLock::new(|| {
-        let library = load();
-        tracing::info!(loaded = library.is_some(), "pages mapped without the wineserver");
-        library
-    });
-
-    fn load() -> Option<(u64, Call)> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        if !super::on_wine() || std::env::var_os("VICTORY_DIRECT_PAGES").is_some_and(|v| v == "0") {
-            return None;
-        }
-        let path = std::env::current_exe().ok()?.with_file_name("victory_pages.so");
-        if !path.is_file() {
-            return None;
-        }
-        let name: Vec<u16> = r"\??\".encode_utf16().chain(path.as_os_str().encode_wide()).collect();
-        let length = u16::try_from(name.len() * 2).ok()?;
-        let name = UnicodeString { length, maximum: length, buffer: name.as_ptr() };
-        // SAFETY: ntdll's exports by their own signatures; Wine's query takes
-        // the library's NT path and gives the module and the call handle.
-        unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            let query: Query = std::mem::transmute(GetProcAddress(ntdll, c"NtQueryVirtualMemory".as_ptr().cast())?);
-            let call = GetProcAddress(ntdll, c"__wine_unix_call_dispatcher".as_ptr().cast())? as *const *const c_void;
-            if (*call).is_null() {
-                return None;
-            }
-            let call: Call = std::mem::transmute(*call);
-            let mut out = [0u64; 2];
-            let status = query(
-                -1,
-                (&raw const name).cast(),
-                LOAD_BY_NAME,
-                out.as_mut_ptr().cast(),
-                size_of_val(&out),
-                std::ptr::null_mut(),
-            );
-            if status != 0 || out[1] == 0 {
-                tracing::warn!(status = format_args!("{status:#x}"), "victory_pages.so not loaded");
-                return None;
-            }
-            Some((out[1], call))
-        }
-    }
+    use victory_gpu::linuxmem;
 
     pub(super) fn on() -> bool {
-        LIBRARY.is_some()
+        linuxmem::direct_pages()
     }
 
     /// Shows the shared pages mapped at `from` at `at` as well.
     pub(super) fn show(from: usize, at: usize, bytes: usize) -> bool {
-        let Some((library, call)) = *LIBRARY else { return false };
-        let mut args = Show { from, bytes, at, result: 0 };
-        // SAFETY: the library's only call; `at` is the caller's reservation.
-        let status = unsafe { call(library, 0, (&raw mut args).cast()) };
-        status == 0 && args.result == at as isize
+        static POPULATE: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("VICTORY_DIRECT_POPULATE").is_ok_and(|v| v.trim() == "1"));
+        linuxmem::show(&[linuxmem::ShowOp { from, at, bytes }], *POPULATE) == 1
     }
 }
 
@@ -2001,15 +1954,25 @@ fn show_direct(base: usize, len: usize, from: usize, own: bool) -> bool {
 /// unmapped, a reservation of [`show_direct`] freed. Nonzero if done.
 fn unshow(at: usize, len: usize, direct: bool) -> i32 {
     // SAFETY: a mapping we made; it becomes a placeholder again.
-    counted(Call::Unmap, || unsafe {
-        if direct {
-            VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
-        } else {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
+    let free = || unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+    // SAFETY: as above.
+    let unmap = || unsafe {
+        UnmapViewOfFile2(
+            GetCurrentProcess(),
+            MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
+            MEM_PRESERVE_PLACEHOLDER,
+        )
+    };
+    counted(Call::Unmap, || {
+        if !direct {
+            return unmap();
+        }
+        // (`direct` is of the section, not of this mapping: one made before
+        // the section's whole view was there is a view, which the host
+        // refuses to free, and nothing else.)
+        match free() {
+            0 => unmap(),
+            done => done,
         }
     })
 }

@@ -1718,6 +1718,19 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
+    // (`VICTORY_NATIVE_PRESENT=1`, LINUXMEM.md S1c) Under Wine: pages that
+    // views of the title's pages show are there, as the runtime told (no
+    // question at all); of others the kernel is asked directly whether it
+    // can read them, without Wine's address-space lock.
+    if crate::linuxmem::native_present() {
+        if crate::inplace::shows_whole(at, len) {
+            crate::linuxmem::DONE[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return (of, of);
+        }
+        if let Some((there, _)) = crate::linuxmem::readable(at, len, all) {
+            return (there, of);
+        }
+    }
     let mut there = 0;
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };

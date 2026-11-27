@@ -24,9 +24,12 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
-/// (LINUXMEM.md) The clock without system calls (`VICTORY_TSC_CLOCK`).
+/// (LINUXMEM.md) The clock without system calls (`VICTORY_TSC_CLOCK`) and the
+/// memory calls answered by Linux under Wine, for the program and `membench`.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub use victory_gpu::tscclock;
+#[cfg(windows)]
+pub use victory_gpu::linuxmem;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 

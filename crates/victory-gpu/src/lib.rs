@@ -65,6 +65,8 @@ pub mod port_descriptors;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+pub mod linuxmem; // (LINUXMEM.md S1) victory_mem.so: memory calls answered by Linux under Wine
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -137,7 +139,7 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_shown, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

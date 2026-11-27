@@ -1337,6 +1337,13 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames)
     );
+    // (LINUXMEM.md) What stage S2a would save, and what S1 does.
+    let [changes, blocks, runs, runs_near] = crate::watch::runs_if_merged().map(|n| n as f64 / frames);
+    tracing::info!(
+        "guards taken per frame: {changes:.0} changes of protection over {blocks:.0} blocks; runs if merged: {runs:.0} \
+         ({runs_near:.0} if runs within 1 MiB were one)"
+    );
+    tracing::info!("linux memory, since the start: {}", crate::linuxmem::done_line());
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(

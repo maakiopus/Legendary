@@ -577,6 +577,16 @@ pub(crate) fn shows_any(start: usize, end: usize) -> bool {
     v.views.range(..end).next_back().is_some_and(|(&base, view)| base + view.0 > start)
 }
 
+/// Whether views the runtime told of show all of `[at, at + len)`.
+pub(crate) fn shows_whole(at: usize, len: usize) -> bool {
+    shown_bytes(at, len).is_some_and(|there| there >= len as u64)
+}
+
+/// [`shows_any`] of `[at, at + len)`, for the runtime (its `XMemVirtualQuery`).
+pub fn title_memory_shown(at: usize, len: usize) -> bool {
+    shows_any(at, at.saturating_add(len.max(1)))
+}
+
 /// Another address of the title memory `[at, at + len)`, if it is a view of
 /// the title's pages, all of it one run of a section: in a view of ours of
 /// the whole section, which is never guarded (`crate::watch`) nor changed.

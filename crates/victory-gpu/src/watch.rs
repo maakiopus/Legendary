@@ -695,6 +695,12 @@ fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // (`VICTORY_NATIVE_SCAN=1`, LINUXMEM.md S1b) Under Wine the kernel is
+    // asked directly: the same answer, without Wine's address-space lock.
+    // Every asking goes one way or the other, never both.
+    if crate::linuxmem::native_scan() {
+        return native_written(first, last);
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -748,6 +754,58 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 Some((last, parts)) if *last == page => *parts |= part,
                 _ => pages.push((page, part)),
             }
+        }
+        Some(pages)
+    })
+}
+
+/// [`kernel_written`] by `crate::linuxmem::written`.
+fn native_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    thread_local! {
+        static RUNS: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        runs.clear();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let answered = crate::linuxmem::written(first * PAGE, (last - first) * PAGE, true, &mut runs);
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(10, u64::from(answered.is_none()));
+            tally(11, started.elapsed().as_nanos() as u64);
+        }
+        if answered.is_none() {
+            // (On the timeline: how many askings the kernel refuses.)
+            crate::timeline::span("asking refused").end();
+            return None;
+        }
+        let mut pages: Vec<(usize, u16)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let mut count = 0u64;
+        for &(start, end) in runs.iter() {
+            let (start, end) = (start.max(first * PAGE), end.min(last * PAGE));
+            for at in (start..end).step_by(KERNEL_PAGE) {
+                let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
+                match pages.last_mut() {
+                    Some((last, parts)) if *last == page => *parts |= part,
+                    _ => pages.push((page, part)),
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    count += 1;
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(12, count);
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            slow(started.elapsed().as_micros() as u64);
+            tally(0, 1);
+            tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
         Some(pages)
     })
@@ -3137,6 +3195,9 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     {
         tally(5, 1);
         tally(8, started.elapsed().as_nanos() as u64);
+        if done {
+            taken_away(block, block + 1);
+        }
     }
     if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
         g.protected.insert(block);
@@ -3151,6 +3212,43 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     PROTECTED.clear(block);
     false
+}
+
+/// (LINUXMEM.md 3.2, the counter asked for before S2a) The runs of blocks
+/// made read-only since the last frame line, one for each change of
+/// protection asked of the host: each is a round of interrupts to every
+/// core the process runs on. Sorted and joined where they touch they are
+/// the changes one native call over merged runs would make.
+#[cfg(feature = "diagnostics")]
+static TAKEN_AWAY: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn taken_away(from: usize, to: usize) {
+    let mut runs = TAKEN_AWAY.lock().unwrap_or_else(|e| e.into_inner());
+    if runs.len() < 1 << 20 {
+        runs.push((from as u32, to as u32));
+    }
+}
+
+/// [`TAKEN_AWAY`], taken: changes of protection, their blocks, the runs if
+/// neighbours were merged, and if runs up to 16 blocks (1 MiB) apart were
+/// too (what lies between made read-only with them).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn runs_if_merged() -> [u64; 4] {
+    let mut runs = std::mem::take(&mut *TAKEN_AWAY.lock().unwrap_or_else(|e| e.into_inner()));
+    let (changes, blocks) = (runs.len() as u64, runs.iter().map(|r| u64::from(r.1 - r.0)).sum());
+    runs.sort_unstable();
+    let merged = |gap: u32| {
+        let (mut n, mut end) = (0u64, None::<u32>);
+        for &(from, to) in &runs {
+            match end {
+                Some(e) if from <= e.saturating_add(gap) => end = Some(e.max(to)),
+                _ => (n, end) = (n + 1, Some(to)),
+            }
+        }
+        n
+    };
+    [changes, blocks, merged(0), merged(16)]
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -3180,6 +3278,9 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         {
             tally(5, (to - from) as u64);
             tally(8, started.elapsed().as_nanos() as u64);
+            if done {
+                taken_away(from, to);
+            }
         }
         done
     };
@@ -3775,7 +3876,9 @@ fn readable_view(at: usize) -> bool {
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == MEM_COMMIT
-        && info.Type == MEM_MAPPED
+        // (Pages the runtime shows by `mremap` under Wine are private memory
+        // to Windows' eye; the runtime told of them.)
+        && (info.Type == MEM_MAPPED || crate::inplace::shows_any(at, at + 1))
         && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
 }
 
