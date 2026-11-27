@@ -359,8 +359,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; under Wine
+/// on by default, see [`no_wait`]).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -384,7 +384,16 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_TEXTURE_NO_WAIT") {
+        // The switch, when set: only `1` turns it on.
+        Some(v) => v == "1",
+        // Under Wine the runtime is remapping title memory nearly all the
+        // time while the world streams; a refresh that waited for it held
+        // the frame for seconds (runs 99-101: up to 3,708 ms a frame, the
+        // wait the whole of it). The Proton fork turns this switch on for
+        // every run; Windows keeps its default (off).
+        None => crate::dxil::on_wine(),
+    })
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
