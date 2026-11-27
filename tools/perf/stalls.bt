@@ -1,0 +1,142 @@
+#!/usr/bin/env bpftrace
+// The stalls of a victory run: where the frame time goes when nothing on
+// the card is busy. Run it as root beside a run
+// (`tools/perf/perf-run.sh` starts it with the sweep):
+//
+//   sudo bpftrace tools/perf/stalls.bt
+//
+// It follows the run's own processes only (the port's threads, the
+// cmd.exe the sweep runs through, wineserver, umu-run, gamescope), and
+// prints:
+//
+// - futex waits over 1 ms, one aggregated line a second: the locks the
+//   preparing thread holds (the guards, the texture pass's queues). The
+//   biggest number of the second is the wall to split.
+// - syscalls over 5 ms as they happen, and their sums a second: mmap,
+//   munmap and mprotect are the watch's mapping work; read and write on
+//   the wineserver's socket are the stock server's view walks (the
+//   patched one should not appear); ioctl is the card's queue and the
+//   driver's views.
+// - the card's submissions (amdgpu_cs_ioctl) and page faults
+//   (amdgpu_vm_fault): the faults the port's guards make on purpose are
+//   the write watch; a flood of them outside a bake or a load is a
+//   mapping gone wrong.
+//
+// For a debugger's own trace of a dead device, the diagnostics build with
+// VICTORY_D3D12_DEBUG=1 names the command the removal was in
+// (`docs/linux-worklog.md`); the sweep's `SWEEP_DEBUG=1` sets both.
+
+BEGIN
+{
+    printf("stalls: futex waits over 1 ms and syscalls over 5 ms of the run's processes, sums a second\n");
+}
+
+// Futex waits: the locks.
+tracepoint:syscalls:sys_enter_futex
+/str(comm) == "victory.exe" || str(comm) == "cmd.exe" ||
+  str(comm) == "wineserver" || str(comm) == "umu-run" ||
+  str(comm) == "gamescope"/
+{
+    @futex_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_futex
+/@futex_start[tid]/
+{
+    $took = (nsecs - @futex_start[tid]) / 1000;
+    if ($took > 1000) {
+        @futex_us[comm] = sum($took);
+        if ($took > 10000) {
+            printf("%-16s tid %-6d futex wait %d us\n", comm, tid, $took);
+        }
+    }
+    delete(@futex_start[tid]);
+}
+
+// The long syscalls, one pair of clauses each: enter marks, exit tells.
+tracepoint:syscalls:sys_enter_mmap
+/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+{ @mmap_start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_mmap
+/@mmap_start[tid]/
+{
+    $took = (nsecs - @mmap_start[tid]) / 1000;
+    if ($took > 5000) { @mmap_us[comm] = sum($took); }
+    delete(@mmap_start[tid]);
+}
+
+tracepoint:syscalls:sys_enter_munmap
+/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+{ @munmap_start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_munmap
+/@munmap_start[tid]/
+{
+    $took = (nsecs - @munmap_start[tid]) / 1000;
+    if ($took > 5000) { @munmap_us[comm] = sum($took); }
+    delete(@munmap_start[tid]);
+}
+
+tracepoint:syscalls:sys_enter_mprotect
+/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+{ @mprotect_start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_mprotect
+/@mprotect_start[tid]/
+{
+    $took = (nsecs - @mprotect_start[tid]) / 1000;
+    if ($took > 5000) { @mprotect_us[comm] = sum($took); }
+    delete(@mprotect_start[tid]);
+}
+
+tracepoint:syscalls:sys_enter_ioctl
+/@str(comm) == "victory.exe" || str(comm) == "wineserver"/
+{ @ioctl_start[tid] = nsecs; }
+tracepoint:syscalls:sys_exit_ioctl
+/@ioctl_start[tid]/
+{
+    $took = (nsecs - @ioctl_start[tid]) / 1000;
+    if ($took > 5000) {
+        @ioctl_us[comm] = sum($took);
+        if ($took > 20000) {
+            printf("%-16s tid %-6d ioctl %d us\n", comm, tid, $took);
+        }
+    }
+    delete(@ioctl_start[tid]);
+}
+
+// The card's queue and its faults.
+tracepoint:amdgpu:amdgpu_cs_ioctl
+/str(comm) == "victory.exe" || comm == "wineserver"/
+{
+    @cs[comm] = count();
+}
+
+tracepoint:amdgpu:amdgpu_vm_fault
+{
+    @vm_faults[comm] = count();
+}
+
+// One line a second: the sums of the second, then cleared.
+interval:s:1
+{
+    print(@futex_us);
+    print(@mmap_us);
+    print(@munmap_us);
+    print(@mprotect_us);
+    print(@ioctl_us);
+    clear(@futex_us);
+    clear(@mmap_us);
+    clear(@munmap_us);
+    clear(@mprotect_us);
+    clear(@ioctl_us);
+}
+
+END
+{
+    clear(@futex_start);
+    clear(@mmap_start);
+    clear(@munmap_start);
+    clear(@mprotect_start);
+    clear(@ioctl_start);
+    clear(@cs);
+    clear(@vm_faults);
+}
