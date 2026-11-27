@@ -1,7 +1,119 @@
 # VIctory on Linux (Proton)
 
-The Windows build runs under Wine/Proton. Renderer port 1
-(`VICTORY_PORT_CONSTANTS=1`, off by default) has two Linux-side notes.
+The Windows build runs under Wine/Proton (Proton Experimental, AMD on Mesa/RADV
+tested). This file is the Linux side: what had to change for the layer to run
+there, how to start it, and what is measured.
+
+**No game files are in this repository.** You need your own dump of the Xbox
+Series build.
+
+## What running under Wine needed
+
+These are in the tree; none changes a Windows run.
+
+- **Every loop one back edge** (`emit/bitcode.rs`, `Module::single_latches`).
+  vkd3d-proton compiles our DXIL with dxil-spirv, which asserts on a loop header
+  with two back edges and otherwise recurses without end in its dominator
+  search. Five pipeline workers died in a stack overflow, their pipelines were
+  never made and the world stayed black. DXC's loops always have one latch, and
+  now ours do as well.
+- **Our helper shaders are compiled with DXC into DXIL at build time**
+  (`src/dxil.rs`, `build.rs`, `shaders/`). Wine's `d3dcompiler_47` (vkd3d-shader)
+  defines no `Load4`, `Store` or `Interlocked*` on byte-address buffers, so the
+  card compare, the up check and the argument clamps did not compile there: the
+  card compare fell back to the PC's memory and indirect executions were
+  dropped. Windows still compiles at run time as before, and a build without a
+  DXC keeps that path too.
+- **An empty host pipeline library through the vkd3d ABI** (`pipeline/library.rs`):
+  vkd3d-proton refuses a null-length blob with a non-null pointer, which the
+  binding passes; the library is asked for with a null pointer now, so pipelines
+  are kept between runs.
+- **A bound on stalled pipeline workers** (`pipeline/make.rs`): under Wine a
+  worker sometimes never returns from the driver's compile; draws stop waiting
+  for it after 15 s instead of spending every frame's budget, and the workers
+  have 8 MiB stacks.
+- **`VICTORY_KEYS` reach GameInput's pad** (`victory-hle/gameinput.rs`): the
+  title reads its pad through GameInput, and the scripted keys only reached
+  XInput before. The start screen needs an A press to load.
+- **Texture fixes ported from victory-royale / aDefaultUser's Wine patch**: a
+  guarded texture is hashed at every check for a while after a change its guard
+  missed, every block of a texture's memory is asked (not only its ends), the
+  texture queue serves first looks in turns, and a slot's host copy is let go
+  only while the slot is still made from the texture the pass read.
+
+## Build
+
+Needs clang/lld (as on Windows) and a DXC to bundle the helper shaders.
+
+```sh
+cargo install cargo-xwin            # once
+# a DXC for this host, from https://github.com/microsoft/DirectXShaderCompiler/releases
+export VICTORY_BUILD_DXC=$HOME/.cache/dxc/bin/dxc
+cargo xwin build --profile diag -p victory --features diagnostics \
+    --target x86_64-pc-windows-msvc
+```
+
+The `diag` profile with `diagnostics` is what a test run wants: `VICTORY_KEYS`
+and `VICTORY_CAPTURE` exist only there. `--release` runs the game too, but
+cannot press a key or save a frame for you.
+
+## Run
+
+Steam with **Proton - Experimental**. No system Wine is used.
+
+```sh
+export PROTONPATH="$HOME/.local/share/Steam/steamapps/common/Proton - Experimental"
+export STEAM_COMPAT_INSTALL_PATH=$HOME/.local/share/Steam/steamapps/common/victory-run
+export STEAM_COMPAT_LIBRARY_PATHS=$HOME/.local/share/Steam/steamapps
+ln -sfn "$PWD/target/x86_64-pc-windows-msvc/diag" "$STEAM_COMPAT_INSTALL_PATH"
+umu-run 'C:\windows\system32\cmd.exe' /c game.bat
+```
+
+with `game.bat` (paths inside the prefix are `Z:` + the Unix path):
+
+```bat
+@echo off
+set VICTORY_GAME_DIR=Z:\media\SSD\GTA6.Xbox.v1.0.2.1-CYBERLEEK
+set VICTORY_CACHE_DIR=Z:\home\you\.cache\victory
+set VICTORY_KEYS=10:Enter,20:Enter,30:Enter,40:Enter,50:Enter,60:Enter,70:Enter,80:Enter
+"Z:\...\diag\victory.exe" run "Z:\...\game_scarlett_master.exe" --execute --console series-x
+```
+
+The title's start screen waits for A (`Enter` on the stand-in pad), so a run
+without keys sits there forever on a black screen. `--console series-x` renders
+one plane; the Series S profile is slower and softer here.
+
+## Sweep and logs
+
+`tools/linux-sweep/run.sh` runs one fixed scenario (same Proton, keys, captures
+and duration) and `analyze.py` prints a stable verdict; `ab.py` puts two sweeps
+side by side. See [`tools/linux-sweep/README.md`](tools/linux-sweep/README.md).
+
+Useful switches under Proton:
+
+| | |
+|---|---|
+| `VICTORY_LOG_FILE=<path>` | also write the log to a file (Proton gives the process its own console, so a shell redirect catches nothing) |
+| `VICTORY_LOG=info` | the per-five-second frame line and the counters (debug is much heavier) |
+| `VICTORY_COPY_COMPARE=1` | put in only the 4 KiB pieces a refresh finds changed; the frame line says how many MB were written and how many were unchanged (off by default) |
+| `VICTORY_ABSENT_CACHE=1` | remember absent title-memory regions instead of asking Wine on every look (off by default: a run with it on stayed at the start screen where the same binary without it reached the world, so a commit path is still to be found) |
+| `VICTORY_WIDE_THREADS=<n>` | threads of the wide refresh passes (default: a third of the logical processors, 2 to 8) |
+| `VICTORY_TEXTURE_NO_WAIT=1` | do not wait for the title-memory remap lock during a texture refresh (the Proton fork's stall fix) |
+| `VICTORY_INDIRECT_WIDE=0` | keep indirect group counts at 65,535 rather than AMD's 2^20 |
+
+## Where it stands (RX 6700 XT, RADV 26.3.1, Proton Experimental 11.0, driver 26.3)
+
+- Boot, splash and loading art, the prologue world: renders. A 10-minute sweep
+  reaches the world (first frame of 500+ draws) about three minutes in and the
+  captures measure mean luminance 80-105, colour cast 1.16-1.39, no shader
+  translation drops, no faults, no device loss.
+- Frame rate in the first world frames is 0.5-4 fps while the title's pipelines
+  are made and its streamed textures are refreshed; the Proton fork reports
+  16-19 fps with renderer ports 1, 2, 5, 6 and 7 on and huge pages for port 1's
+  heap. Those ports are off here and not yet re-measured on this GPU.
+- Ray tracing is off: the structure builder is opt-in (`VICTORY_BVH_BUILDER=1`),
+  and without its pipelines the title's ray passes are dropped by design
+  (about 330 draws a frame).
 
 ## Renderer port 1 under Wine
 
@@ -14,7 +126,7 @@ private memory, and the heap is opened on the title's own pages.
 `VICTORY_PORT_PRIVATE=0` keeps the views as before. Port 1 stays opt-in: neither
 path runs with `VICTORY_PORT_CONSTANTS` unset.
 
-## Huge pages for renderer port 1 (recommended)
+## Huge pages for renderer port 1 (recommended with port 1)
 
 Under vkd3d-proton the port-1 heap is a userptr, and amdgpu checks every page of
 it on every submission. With 4 KiB pages that kept the `vkd3d_queue` thread at
