@@ -16,12 +16,19 @@ RSS <= 16 GiB; VRAM <= 11 GiB with GTT checked. No push.
 
 - [ ] **#497 audio: XMA decoder lock split + MMCSS** (small, one file; audio
       cutouts during slow frames; no FPS claim)
-  - [ ] code review
+  - [x] code review: GO. Lock order `voice -> ring` verified; apply clean;
+        9/9 audio tests under Wine (including the new read-advance test);
+        clippy clean; new `avrt.dll` import present in Wine.
   - [ ] build + 900 s x 2; audio check (`takes`/`partial` counters, no cutouts)
 - [ ] **#437 indexed card-step dependency planner** (small, one file; 12.1x
       synthetic planner speedup; gameplay FPS unmeasured)
-  - [ ] code review
-  - [ ] baseline vs patched, 900 s x 2; compare `perf-summary.json` median/p95
+  - [x] code review: GO on correctness (800k-case independent fuzz, 9/9 tests,
+        clean apply, off by default). Perf claim is gated: the index only runs
+        when `steps * copies >= 262_144`, while steady state is ~7,500 fills
+        with 1-2 copies (~7.5k-15k). Measure N and C from the
+        `card_steps.rs:905` "steps done on the card" line first; only then
+        benchmark with `VICTORY_CARD_STEPS=2` (and `VICTORY_RELAY=2`). Do not
+        ship the FPS claim without that measurement.
 
 ## Batch 2 - small correctness and QoL
 
