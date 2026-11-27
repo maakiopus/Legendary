@@ -241,7 +241,9 @@ void keep(uint3 at : SV_DispatchThreadID) {
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
-        c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
+        // Wine's vkd3d-shader defines no isnan or isinf; the exponent bits
+        // say the same: NaN and +-Inf have every exponent bit set.
+        c = any((asuint(c) & 0x7fffffffu) >= 0x7f800000u) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
