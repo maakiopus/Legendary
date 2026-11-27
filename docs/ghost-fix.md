@@ -1,9 +1,22 @@
 # Ghosting on the character's body and shirt
 
-> **Status, 27 Nov 2026:** the ghost is still present. Two GPU fixes were
-> tried and did not remove it; all GPU changes are reverted to HEAD. The
-> attempt is kept as `docs/ghost-notes/2026-11-27-alias-attempt.patch`.
-> Treat this file as a working record, not a fix that is in the tree.
+> **Status, 27 Nov 2026 (revert 9bbd8a7):** the ghost is still present. The
+> GPU fixes of the merge `b5d4598` (`65498fd` alias in the texture pass,
+> `c2ab4b5` full-recheck looks) were reverted: neither fixed the ghost,
+> and a run with them (`sweep-ghost-watch`, diagnostics build) read
+> 13.5 GB of title memory in 4 minutes to upload 112 textures and left
+> 450,336 looks due for later frames, so gameplay lost the texture pass.
+> Both commits were written without a game run ("Not run: Proton, Wine and
+> the game" in their messages). The earlier attempt is kept as
+> `docs/ghost-notes/2026-11-27-alias-attempt.patch`. Treat this file as a
+> working record, not a fix that is in the tree.
+>
+> One measured negative from that run: every logged copy's destination
+> had `containers=[]` — no copy landed inside another texture. The
+> "pages inside the atlas" theory of `alias_of`'s address bridge is dead;
+> the atlas the shirt samples is written directly (2048x2048 BC3 m12 at
+> 0xe16200000, copies per mip from f3 block textures) or is one of the
+> many standalone 256x256x9 BC pages (f71/f78/f99).
 
 ## Symptom
 
