@@ -1825,6 +1825,23 @@ pub(crate) fn mapped_bytes_between(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
+        // A texture wholly away is the common case behind an answer of none
+        // (thousands of slots a frame): eight probes across it say so
+        // without asking every block. A partial texture pays them and then
+        // the scan.
+        let step = (end - start).div_ceil(8).max(1);
+        let mut probe = start;
+        let mut any = false;
+        while probe < end {
+            if readable(probe, 1, true).0 == 1 {
+                any = true;
+                break;
+            }
+            probe = probe.saturating_add(step);
+        }
+        if !any {
+            return 0;
+        }
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
         while block < end {
