@@ -117,7 +117,7 @@ GAME_NAME=${GAME##*[\\/]}
 # replaces a host value and, because it does not set `read_cfg`, stops
 # MangoHud reading the host's MangoHud.conf as well: these keys are the
 # whole overlay, whatever the host had.
-HUD_BASE="time=1,fps,frametime,cpu_stats=1,gpu_stats=1,cpu_temp=1,gpu_temp=1,cpu_power=1,gpu_power=1,core_load=1,position=top-left,font_scale=0.7,background_alpha=0.35,no_display=0"
+HUD_BASE="read_cfg=0,time=1,fps,frametime,cpu_stats=1,gpu_stats=1,cpu_temp=1,gpu_temp=1,cpu_power=1,gpu_power=1,core_load=1,position=top-left,font_scale=0.7,background_alpha=0.35,no_display=0"
 case ${VICTORY_HUD:-1} in
 0) HUD=0; HUD_LABEL=off; HUD_CFG= ;;
 1) HUD=1; HUD_LABEL=compact; HUD_CFG="$HUD_BASE,hud_compact" ;;
