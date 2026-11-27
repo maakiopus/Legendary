@@ -1256,11 +1256,13 @@ pub(crate) fn held_only() -> bool {
 }
 
 /// The first level a placed texture's view shows: of views of one 2D
-/// texture (the others show whole textures). After victory-amd 4436f8f1.
+/// texture or 2D array, whose first level is the same word (the others
+/// show whole textures). After victory-amd 4436f8f1.
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
     const TEXTURE_2D_VIEW: u32 = 4;
+    const TEXTURE_2D_ARRAY_VIEW: u32 = 5;
     match *view {
-        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
+        [_, TEXTURE_2D_VIEW | TEXTURE_2D_ARRAY_VIEW, _, _, first, ..] => first.min(15),
         _ => 0,
     }
 }
@@ -4645,6 +4647,27 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// A view of one 2D texture or 2D array shows the level it starts at (a
+    /// single-layer array's too); other views show whole textures.
+    #[test]
+    fn views_of_one_2d_texture_or_array_start_at_their_level() {
+        let view = |dimension: u32, first: u32| {
+            let mut words = [0u32; 16];
+            (words[0], words[1], words[4], words[5]) = (98, dimension, first, 1);
+            words
+        };
+        assert_eq!(first_mip(&view(4, 3)), 3);
+        // A single-layer array: the slice's fields follow the mip's.
+        let mut array = view(5, 3);
+        (array[6], array[7]) = (1, 0);
+        assert_eq!(first_mip(&array), 3);
+        assert_eq!(first_mip(&view(5, 0)), 0);
+        // A 1D array and a buffer show whole textures.
+        assert_eq!(first_mip(&view(3, 3)), 0);
+        assert_eq!(first_mip(&view(1, 3)), 0);
+        assert_eq!(first_mip(&view(4, 16)), 15);
     }
 
     #[test]
