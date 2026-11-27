@@ -26,6 +26,21 @@ scripted keys reaching GameInput, a bounded worker stall, texture guard/queue
 fixes, a draw-time recheck of indexed and UAV-written textures, and `NO_WAIT`
 under Wine.
 
+### Measured here (2026-11-27, RX 6700 XT)
+
+| Configuration | World | Frame |
+|---|---|---|
+| Stock Proton Experimental, defaults, Series X | reaches it in ~3 min, PASS (mean luminance 96–104, cast 1.15–1.50) | 2–4 fps, 250–300 ms, no multi-second spikes after the fixes |
+| GE-Proton11-14 + patched view-tree wineserver, defaults, Series X | reaches it in ~2 min, PASS (279 world captures) | 3.3–3.8 fps; **write-watch asking 7–9 ms** (stock: 50–132 ms) |
+| Same, Series S | PASS, water present (verified in the capture) | 3.6 fps |
+| Aggressive: Series S + port 1 + THP + copy switches | 6.0 fps | but the **water vanished**: port 1’s private pages are not watched, so streamed/ocean memory can go stale — that config is not safe |
+
+The 20 fps target is not reached yet. The GPU is ~51 ms at Series S and ~100 ms
+at Series X, so Series X alone caps near 10 fps even with a perfect CPU; the
+rest is the CPU/lock work (copies ~50 ms, copy-back ~60 ms, list steps ~77 ms)
+that the patched wineserver and the remaining ports attack. Series X stays the
+intended profile; Series S is only a test lever until those costs fall.
+
 Build and run: [`LINUX.md`](LINUX.md). Deterministic sweeps:
 [`tools/linux-sweep/`](tools/linux-sweep/README.md). Frame-time breakdown, port
 status, rejected paths and the wineserver view-tree plan:
