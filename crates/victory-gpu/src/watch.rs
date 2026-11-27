@@ -2216,7 +2216,7 @@ fn tally(what: usize, n: u64) {
 
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 13] {
+pub(crate) fn asks() -> [u64; 14] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
