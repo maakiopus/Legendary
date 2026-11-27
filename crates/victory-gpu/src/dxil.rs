@@ -16,6 +16,16 @@
 //! Only Wine takes them: Windows keeps compiling at run time as it always
 //! did, so a fork run there cannot change because of this file.
 
+/// The exe's own note that the build carries the helper shaders as DXIL
+/// ([`bundled`]): the run scripts and the sweep look for these bytes in the
+/// file, and warn how to build when they are not there (Wine's compiler
+/// refuses the byte-address helpers at run time). `#[used]` keeps it in the
+/// file; the linker cannot take it.
+#[cfg(all(target_os = "windows", victory_dxil))]
+#[used]
+#[unsafe(link_section = ".rodata")]
+static BUNDLED_MARKER: [u8; 20] = *b"victory-dxil-bundled";
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};

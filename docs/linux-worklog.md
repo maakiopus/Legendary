@@ -158,13 +158,21 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
 
 ## Where it stands
 
-- Build note, 27 Nov: do not set `VICTORY_BUILD_DXC` for Wine runs on this
-  tree while the shader gap is open. The DXIL-bundled diag build is
-  suspected of the unlit/dark models seen after it; build without the
-  variable and with no `dxc` on PATH to use the runtime
-  `d3dcompiler_47` path, which is the known-good one. The helper shaders
-  only DXC can compile are the card-compare, up-check and argument-clamp
-  ones.
+- Build note, 27 Nov, corrected the same day: build WITH the helpers
+  bundled (`VICTORY_BUILD_DXC=$HOME/.cache/dxc/bin/dxc`, or
+  `tools/build.sh fast`, which finds or fetches dxc). Wine's
+  `d3dcompiler_47` (vkd3d-shader) cannot compile them at run time (the
+  byte-address intrinsics fail with E5005), and without the bundled ones
+  the argument clamp never exists: the world's indirect records drop — a
+  black world behind a working HUD (three runs saw it), or, with the
+  fallback, the GPU takes the records the clamp would have cut (a device
+  removed, 0x887A0005). The earlier note suspected the DXIL-bundled diag
+  build of unlit models; a bundled build is what rendered the world all
+  along (sweep-ghost4, alias-fix1), and the exe itself now carries the
+  bytes `victory-dxil-bundled` when the helpers are in it, which the run
+  scripts check. Without dxc a native Microsoft `d3dcompiler_47` beside
+  the exe answers the run-time compile instead
+  (`tools/d3dcompiler.sh`, fetched like winetricks fetches it).
 
 - Series X, defaults, GE-Proton11-14-vt: PASS, world ~2 min, settled
   **12.9 fps**, stable frame times, water, no crashes.

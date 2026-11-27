@@ -51,6 +51,10 @@ FAULT = re.compile(
 )
 CRASH = re.compile(r"\bunhandled exception\b|\bWER - Saving\b|\bBreakpad\b", re.IGNORECASE)
 INDIRECT_FAIL = re.compile(r"no argument clamp: indirect execution dropped")
+# The black world: the clamp is gone and the world's indirect records drop.
+NOT_BOUNDED = re.compile(
+    r"dropped (?P<n>[0-9.]+)/frame without a host pipeline: indirect kind \d+: not bounded"
+)
 DEPTH_FAIL = re.compile(r"no pipeline to draw a depth plane")
 # Wine-only degradations: vkd3d-shader refuses a helper shader or the empty
 # library, so a feature silently falls back and frame time is not what a
@@ -76,6 +80,7 @@ def analyse(log: Path, captures: Path) -> int:
     faults = 0
     crashes = 0
     indirect = 0
+    not_bounded = 0.0
     depth = 0
     card_compare = 0
     library_fail = 0
@@ -112,6 +117,8 @@ def analyse(log: Path, captures: Path) -> int:
             crashes += 1
         if INDIRECT_FAIL.search(clean):
             indirect += 1
+        if m := NOT_BOUNDED.search(clean):
+            not_bounded = max(not_bounded, float(m["n"]))
         if DEPTH_FAIL.search(clean):
             depth += 1
         if CARD_COMPARE_FAIL.search(clean):
@@ -206,6 +213,7 @@ def analyse(log: Path, captures: Path) -> int:
         print(f"world_captures={len(after)} world_nonblank={sum(p.stat().st_size > 100_000 for p in after)}")
     print(f"world_marker={world or 'NONE'}")
     print(f"faults={faults} crashes={crashes} indirect_drops={indirect} depth_plane_drops={depth}")
+    print(f"indirect_unclamped_drops={not_bounded:.0f}/frame")
     print(f"wine_shader_failures card_compare={card_compare} pipeline_library={library_fail} "
           f"helper_shaders={len(helper_errors)}")
     for error, count in Counter(helper_errors).most_common(5):
@@ -254,7 +262,7 @@ def analyse(log: Path, captures: Path) -> int:
     blown = bool(world) and bool(tint) and max(x[4] for x in tint) > 0.25
     ok = (bool(world) and not faults and not crashes and not shader_drops
           and not black_frames and not dark_screen and not color_cast
-          and not card_compare and not library_fail)
+          and not card_compare and not library_fail and not indirect)
     if dark_screen:
         print("DARK_SCREEN: every large capture is a dark loading screen, not the world")
     if color_cast:
@@ -265,6 +273,12 @@ def analyse(log: Path, captures: Path) -> int:
     if card_compare:
         print("WINE_SHADER_FAIL: the card compare's HLSL did not compile under "
               "vkd3d's compiler; title copies stay in the PC's memory")
+    if indirect:
+        print("NO_ARGUMENT_CLAMP: the argument clamp's HLSL did not compile under Wine's "
+              "d3dcompiler (byte-address intrinsics, E5005); the world's indirect records "
+              f"run unclamped (worst {not_bounded:.0f}/frame dropped before the fallback). "
+              "Build the helpers in: tools/build.sh fast (VICTORY_BUILD_DXC), or stage a "
+              "native d3dcompiler_47 beside the exe (tools/d3dcompiler.sh)")
     if library_fail:
         print("WINE_LIBRARY_FAIL: vkd3d refused the empty host pipeline library; "
               "pipelines are not kept between runs")

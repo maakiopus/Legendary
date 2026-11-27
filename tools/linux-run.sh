@@ -30,6 +30,10 @@ set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 EXE=${VICTORY_EXE:-$ROOT/target/x86_64-pc-windows-msvc/diag/victory.exe}
+# The helpers (card compare, up check, argument clamps) only DXC compiles:
+# without them the world's indirect records drop (`tools/d3dcompiler.sh`).
+source "$ROOT/tools/d3dcompiler.sh"
+source "$ROOT/tools/dxc.sh"
 CONSOLE=${VICTORY_CONSOLE:-series-x}
 PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental}
 LOG_DIR=${VICTORY_LOG_DIR:-$HOME/victory-logs}
@@ -80,6 +84,26 @@ if [ -z "$GAME" ]; then
     exit 2
 fi
 RUN_ARGS=("$@")
+
+# The preflight: say what the exe and the tools are before anything runs.
+if [ ! -f "$EXE" ]; then
+    echo "linux-run: no exe at $EXE (tools/build.sh fast builds it)" >&2
+    exit 2
+fi
+DXC=$(find_dxc || true)
+echo "dxc: ${DXC:-none} (the build bundles the helpers with it; tools/build.sh fast does)"
+if dxil_bundled "$EXE"; then
+    echo "helpers: bundled DXIL in the exe"
+else
+    echo "helpers: none in the exe — a native d3dcompiler_47 beside it answers the run-time compile" >&2
+    if ensure_d3dcompiler_47 "$EXE"; then
+        # Wine prefers a native dll under the override; the run's umu-run
+        # environment carries it.
+        export WINEDLLOVERRIDES="d3dcompiler_47=n,b${WINEDLLOVERRIDES:+:$WINEDLLOVERRIDES}"
+    else
+        echo "linux-run: without the helpers the world's indirect records drop (a black world)" >&2
+    fi
+fi
 
 # The Wine drive umu-run exposes: / -> Z:.
 wine() {
@@ -238,6 +262,9 @@ render_bat() {
     for name in "${BAT_ENV[@]}"; do
         printf 'set "%s=%s"\n' "$name" "$(pct "${!name}")"
     done
+    # The native d3dcompiler_47 override the run path carries in its own
+    # environment: the bat has to set it itself.
+    [ -n "${WINEDLLOVERRIDES:-}" ] && printf 'set "WINEDLLOVERRIDES=%s"\n' "$(pct "$WINEDLLOVERRIDES")"
     printf 'echo.\n'
     printf '%s\n' "$BAT_RUN"
     printf 'set "VICTORY_RC=%%ERRORLEVEL%%"\n'

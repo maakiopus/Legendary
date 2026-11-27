@@ -175,9 +175,11 @@ longer take the level-holding path (`resource.rs` `held_only`): memory only.
 
 ## Reproduction
 
-Build with diagnostics. **Do not set `VICTORY_BUILD_DXC`** while the
-dark-model regression is open; the runtime `d3dcompiler_47` path is the
-known-good one (see `docs/linux-worklog.md`, build note):
+Build with diagnostics, the helpers bundled (`tools/build.sh fast` finds
+or fetches dxc; the exe then carries `victory-dxil-bundled`). Wine's
+`d3dcompiler_47` cannot compile the helpers at run time, and a build
+without them draws a black world (see `docs/linux-worklog.md`, build
+note, corrected):
 
 ```sh
 CARGO_TARGET_DIR=$HOME/.cache/main-target cargo xwin build --profile diag \
