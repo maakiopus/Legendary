@@ -82,9 +82,22 @@ export PROTONPATH=$HOME/.local/share/Steam/steamapps/common/GE-Proton11-14-vt
 `tools/build.sh fast`, builds and installs the patched GE-Proton package when
 `makepkg` and passwordless sudo are available, builds the huge-page helper and
 gives it `cap_sys_nice`, sets the play defaults (warn log, 0.667 render
-scale, joined card rehash, card steps and joined copies; `VICTORY_INPLACE`
-stays off), then calls `tools/linux-run.sh`. `RUN_BUILD_GAME=0` and
-`RUN_BUILD_WINE=0` turn off the automatic steps.
+scale, joined card rehash, card steps, joined copies, and the memory-path set
+measured on a fixed save: `VICTORY_RELAY_COPY=1`, `VICTORY_COPY_COMPARE=1`,
+`VICTORY_COPY_BESIDE=1`, `VICTORY_STORE_BESIDE=1`,
+`VICTORY_LATE_WAIT_LISTS=1024`, card buffers from a 64 KiB floor to a
+1536 MB total cap), then calls `tools/linux-run.sh`. `VICTORY_INPLACE` stays
+off. `RUN_BUILD_GAME=0` and `RUN_BUILD_WINE=0` turn off the automatic steps.
+
+The beside switches (`VICTORY_COPY_BESIDE`, `VICTORY_STORE_BESIDE`) write
+the title's copies and stores through our own view of the pages instead of
+faulting: an unrecognized store or a block's fifth store opens the block as
+before, so the path is best-effort, and its gain is specific to this game
+build — re-validate after a game-exe change, and revert with
+`VICTORY_COPY_BESIDE=0 VICTORY_STORE_BESIDE=0`. The card sizes above were
+measured on a 12 GB RX 6700 XT; on other cards override
+`VICTORY_CARD_BUFFERS_MB` / `VICTORY_CARD_BUFFERS_MIN_KB` (or
+`VICTORY_CARD_BUFFERS_MIN_MB`, which takes precedence over the KB floor).
 
 ```sh
 ./run.sh /media/SSD/GTA6.Xbox.v1.0.2.1-CYBERLEEK/game_scarlett_master.exe
@@ -152,7 +165,7 @@ Useful switches under Proton:
 |---|---|
 | `VICTORY_LOG_FILE=<path>` | also write the log to a file (Proton gives the process its own console, so a shell redirect catches nothing) |
 | `VICTORY_LOG=info` | the per-five-second frame line and the counters (debug is much heavier) |
-| `VICTORY_COPY_COMPARE=1` | put in only the 4 KiB pieces a refresh finds changed; the frame line says how many MB were written and how many were unchanged (off by default) |
+| `VICTORY_COPY_COMPARE=1` | put in only the 4 KiB pieces a refresh finds changed; the frame line says how many MB were written and how many were unchanged (on in `./run.sh`'s play defaults; off in a direct build) |
 | `VICTORY_ABSENT_CACHE=1` | remember absent title-memory regions instead of asking Wine on every look (off by default: a run with it on stayed at the start screen where the same binary without it reached the world, so a commit path is still to be found) |
 | `VICTORY_WIDE_THREADS=<n>` | threads of the wide refresh passes (default: a third of the logical processors, 2 to 8) |
 | `VICTORY_TEXTURE_NO_WAIT=1` | do not wait for the title-memory remap lock during a texture refresh (the Proton fork's stall fix) |

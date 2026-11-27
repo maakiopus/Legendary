@@ -14,9 +14,15 @@
 #     then execs tools/linux-run.sh.
 #
 # Play defaults: warn-level logging, 0.667 render scale, joined card rehash
-# runs, card steps on the card and joined copies. VICTORY_INPLACE is
-# deliberately not set: it regressed in testing. RUN_BUILD_WINE=0 and
-# RUN_BUILD_GAME=0 skip the package and exe builds.
+# runs, card steps on the card and joined copies, plus the memory-path set
+# measured on a fixed save (157.7 -> 139.2 ms a frame in a 480 s arm, p99
+# 391 -> 192; a 660 s validation of the same set: 140.9 ms, p99 215.3, no
+# spikes, no faults): the relay's fetches on the copy queue, refreshes that
+# skip unchanged bytes, the title's copies and stores written beside the
+# guards, 1024 lists in the air, and card buffers from a 64 KiB floor to a
+# 1536 MB cap. VICTORY_INPLACE is deliberately not set: it regressed in
+# testing. RUN_BUILD_WINE=0 and RUN_BUILD_GAME=0 skip the package and exe
+# builds.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 DRY=0
@@ -84,4 +90,13 @@ export VICTORY_RENDER_SCALE=${VICTORY_RENDER_SCALE:-0.667}
 export VICTORY_CARD_REHASH_RUNS=${VICTORY_CARD_REHASH_RUNS:-1}
 export VICTORY_CARD_STEPS=${VICTORY_CARD_STEPS:-2}
 export VICTORY_JOIN_COPIES=${VICTORY_JOIN_COPIES:-1}
+export VICTORY_RELAY_COPY=${VICTORY_RELAY_COPY:-1}
+export VICTORY_COPY_COMPARE=${VICTORY_COPY_COMPARE:-1}
+export VICTORY_COPY_BESIDE=${VICTORY_COPY_BESIDE:-1}
+export VICTORY_STORE_BESIDE=${VICTORY_STORE_BESIDE:-1}
+export VICTORY_LATE_WAIT_LISTS=${VICTORY_LATE_WAIT_LISTS:-1024}
+if [ -z "${VICTORY_CARD_BUFFERS_MIN_MB:-}" ]; then
+    export VICTORY_CARD_BUFFERS_MIN_KB=${VICTORY_CARD_BUFFERS_MIN_KB:-64}
+fi
+export VICTORY_CARD_BUFFERS_MB=${VICTORY_CARD_BUFFERS_MB:-1536}
 exec "$ROOT/tools/linux-run.sh" "$@"
