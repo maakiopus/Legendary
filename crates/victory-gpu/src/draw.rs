@@ -733,6 +733,13 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Whether a slot stays on the longest wait of [`RECHECK_FRAMES`] after the
+/// schedule ended (`VICTORY_HEAP_RECHECK_FOREVER=0`: no).
+fn recheck_forever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK_FOREVER").is_none_or(|v| v != "0"))
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -745,7 +752,8 @@ pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 /// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
 /// no, as before: they stay due, each pass looks at the same ones again
 /// and stops at the 257th). Held back, such a slot is looked at again
-/// after about four seconds or as soon as the card has room, and the pass
+/// after about twenty seconds (`VICTORY_RELOOK_MS` unless said) or as soon
+/// as the card has room, and the pass
 /// goes on to the slots behind it: the ones whose host copy exists and
 /// only wants bringing up to date, and the ones whose memory went (letting
 /// their host copies go is what makes room). What is uploaded while the
@@ -2344,21 +2352,36 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
-        // The frames in about four seconds, between 16 and 256: how long a
-        // slot with nothing to upload waits at most for its next look. In
-        // frames alone it was 120: four minutes at the opening cutscene's
-        // half a frame per second, while the title streams by the clock.
-        // (About a second before the runtime told of the memory it maps:
-        // the looks are now only for what that does not tell.)
+        // The frames in which a slot with nothing to upload is looked at
+        // again at most (`VICTORY_RELOOK_MS`, 20,000 unless said; 4,000 and
+        // at most 256 before), between 16 and 1024. In frames alone it was
+        // 120: four minutes at the opening cutscene's half a frame per
+        // second, while the title streams by the clock. (About a second
+        // before the runtime told of the memory it maps: the looks are now
+        // only for what that does not tell.)
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         // (`took` is since the last pass, of any heap and list: several a
-        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
-        // second; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's time.)
+        // frame, so 256 frames was 13-18 s at 14-20 frames a second, and
+        // 1024 is 50-70 s; `VICTORY_TEXTURE_LOOK_MS` counts by the frame's
+        // time.)
         let most = match look_ms() {
             Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
-            None => (4000 / took).clamp(16, 256),
+            // `VICTORY_RELOOK_MS` (20,000 unless said; 4,000 before): a slot
+            // whose memory is not mapped is looked at again after at most
+            // that long; the runtime's mappings already make such a slot
+            // due (after fxceless/victory-fork #1246, faf709b5).
+            None => {
+                static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let relook = *RELOOK_MS.get_or_init(|| {
+                    std::env::var("VICTORY_RELOOK_MS")
+                        .ok()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(20_000)
+                });
+                (relook / took).clamp(16, 1024)
+            }
         };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
@@ -2428,13 +2451,15 @@ impl State {
             // every 120 frames, changed or not; and asked by its first
             // page alone, one whose first page is the one missing counted
             // as not there.)
-            // A slot uploaded whole is looked at again a few times
-            // (`RECHECK_FRAMES`): the title writes a texture's view, and
-            // may fill the texture's memory itself only afterwards, with
-            // no descriptor write and nothing from the runtime to tell of
-            // it. The host copy then kept what the memory held at the
-            // first look for the rest of the run. The look reads 48 KiB;
-            // only a changed texture is uploaded again.
+            // A slot uploaded whole is looked at again (`RECHECK_FRAMES`:
+            // 4, 12, 40, 120 and 400 frames, then on the 400 alone for as
+            // long as it lives unless `VICTORY_HEAP_RECHECK_FOREVER=0`): the
+            // title writes a texture's view, and may fill the texture's
+            // memory itself only afterwards, with no descriptor write and
+            // nothing from the runtime to tell of it. The host copy then
+            // kept what the memory held at the first look for the rest of
+            // the run. The look reads 48 KiB; only a changed texture is
+            // uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -2449,6 +2474,21 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
+                        // The schedule ended and the slot was never looked
+                        // at again: a texture the title streamed in anew at
+                        // the same address minutes later (hair, a face)
+                        // kept its first copy. It stays on the longest wait
+                        // (`VICTORY_HEAP_RECHECK_FOREVER=0`: done, as before;
+                        // after DoubleGhosty/cool_fox 8c23f185).
+                        None if recheck_forever() => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + RECHECK_FRAMES[RECHECK_FRAMES.len() - 1],
+                            (at, len),
+                            print,
+                            looks,
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
