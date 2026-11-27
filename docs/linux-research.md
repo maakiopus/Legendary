@@ -135,6 +135,22 @@ into a copy of the Proton install; a stock Wine 11.0 server is being built
 against GE-Proton11-14 first (both report Wine 11.0), then the same for
 Experimental if the protocol matches.
 
+Built here (2026-11-27): the server protocol must match the Proton's Wine
+exactly, and it differs far more than the version string suggests — plain Wine
+11.0 answers protocol **930**, Wine 11.0 + staging 11.0 **931**, Proton
+Experimental **931**, GE-Proton11-14 **938** (GE's patch series bumps
+`include/wine/server_protocol.h`, and `tools/make_requests` adds one). The
+patched server was therefore built from GE's actual tree: ValveSoftware/wine
+`a47c73f` + the wine block of GE's `protonprep-valve-staging.sh` (2078 patches,
+0 failed), the view-tree patch applied with no fuzz, `make server/wineserver`
+(5,388,848 B, sha256 `9d4cfcdc…52cd5a`), installed in
+`~/.local/share/Steam/steamapps/common/GE-Proton11-14-vt`; the original
+`GE-Proton11-14-x86_64` is untouched and the protocol check
+(`umu-run cmd /c echo ok`) passes. Experimental keeps its stock server: its
+931 handshake rejects the 938 binary, so it needs a second build from its own
+Valve wine commit. A/B line: `PROTONPATH=…/GE-Proton11-14-vt` against
+`…/GE-Proton11-14-x86_64`.
+
 Secondary, not yet ported: aDefaultUser `853d7af1` (never ask the kernel about
 view memory the guards already hold — 4,950 refused asks/frame) and `6dea2976`
 (write route when `ptrace_scope=2` refuses Windows write calls).
