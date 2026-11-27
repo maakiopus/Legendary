@@ -2326,14 +2326,14 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let baking = crate::texture::BAKING.get();
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 }, room);
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16, room);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2480,18 +2480,48 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            let observed = heap.handle(index).and_then(crate::descriptor::view);
+            if let Some(placed @ View::Placed(false, resource, desc)) = &observed {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(&desc);
-                let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let first = crate::resource::first_mip(desc);
+                let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
+                let mut mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                // A slot made from this texture (this view, or an older one
+                // of it the slot keeps showing) has a host copy that an
+                // answer of none lets go, and one of part writes over with
+                // what is missing when it was last uploaded whole (or by a
+                // draw). Such an answer is taken again, with every block
+                // asked (neither end mapped reads as none, with blocks
+                // between them mapped or not), while the runtime changes no
+                // mapping: in a change, pages it keeps read as not there
+                // (`watch::title_memory_reading`), and held until the copy is
+                // let go on it: given back before the upload below, which
+                // takes its own. While a change is under way the copy stays
+                // and the slot is looked at again later. The thousands of
+                // slots made from nothing keep the cheap answer.
+                let made_of = if mapped < len { host.texture_slot_made_of(index, placed) } else { None };
+                let reading = if made_of.is_some() && (mapped == 0 || host.texture_slot_mapped(index) == 0) {
+                    let Some(reading) = crate::watch::title_memory_reading_now() else {
+                        host.texture_slot_later(index, write, frame, most);
+                        continue;
+                    };
+                    mapped = crate::texture::mapped_bytes_between(address as *const u8, len as usize);
+                    Some(reading)
+                } else {
+                    None
+                };
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: what the slot showed is let go, unless
+                    // it was made anew since it was read.
+                    if let Some(key) = made_of {
+                        host.texture_slot_gone(index, key);
+                    }
+                    drop(reading);
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                drop(reading);
                 host.texture_slot_here(index);
                 there = Some(mapped);
                 if mapped < len {
