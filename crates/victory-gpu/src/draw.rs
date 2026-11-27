@@ -790,6 +790,10 @@ fn heap_recheck() -> bool {
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
+/// Slots whose host copy was filled from a texture the host wrote, at the
+/// same memory (a bake's atlas, a shader's unordered access), since the
+/// start: their texels are on the card in that texture, not in title memory.
+pub(crate) static HEAP_TEXTURES_ALIASED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
@@ -2706,6 +2710,15 @@ impl State {
             };
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
+                // A placed view of memory the host wrote (a bake's atlas, a
+                // shader's unordered access): its texels are on the card in
+                // that texture; title memory, which this host copy was
+                // filled from, may not have them. Copy them in.
+                if crate::resource::alias_of(resource)
+                    .is_some_and(|source| crate::texture::alias(list, resource, source))
+                {
+                    HEAP_TEXTURES_ALIASED.fetch_add(1, Ordering::Relaxed);
+                }
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if shows_other && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
@@ -4560,7 +4573,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // pass makes the slots that show it due, a few a frame, rather
             // than leaving them to the 400-frame look
             // (`VICTORY_UAV_RECHECK=0`: only the look, as before).
-            crate::descriptor::host::uav_written(*resource as This);
+            crate::descriptor::host::gpu_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

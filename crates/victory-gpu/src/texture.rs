@@ -644,6 +644,18 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// The resource a host copy or a write through unordered access filled
+/// whose title memory covers `address` ([`host_written`]), if any: a placed
+/// view there is filled from it, not from title memory, which the write
+/// never reached.
+pub(crate) fn host_written_at(address: u64) -> Option<This> {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    map.range(..=address)
+        .next_back()
+        .filter(|(at, d)| address < **at + d.0)
+        .map(|(_, d)| d.5 as This)
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());

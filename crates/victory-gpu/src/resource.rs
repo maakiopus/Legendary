@@ -1527,8 +1527,18 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         return None;
     }
     // Under the table's lock: a texture leaves it before it is freed.
-    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let target = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.get(&(r.data() as u64)).copied()
+    };
+    // A target at this address, or a texture the host copied into or wrote
+    // through unordered access there: its host copy holds the texels;
+    // title memory, which this view's host copy is filled from, may not
+    // (a bake's atlas is copied into in tiles, and a placed view of it was
+    // filled from the memory those tiles never reached).
+    let other = target
+        .map(|at| at as This)
+        .or_else(|| crate::texture::host_written_at(r.data() as u64))?;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -1539,7 +1549,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.depth_or_array_size == r.desc.depth_or_array_size
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+        && element(o.desc.format).is_some_and(|e| Some(e) == element(r.desc.format));
     if !same && r.desc.sample_count <= 1 {
         // What shaders wrote there is on the card in the other texture; this
         // one is filled from title memory, which they never reached. Each

@@ -9388,12 +9388,13 @@ impl Meter {
                         [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                     let [same, parts, tails] =
                         [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+                    let aliased = crate::draw::HEAP_TEXTURES_ALIASED.load(Ordering::Relaxed);
                     tracing::info!(
                         "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
                          {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
                          the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                          as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
-                         {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
+                         {same} looks that found no more mapped; {aliased} shown from a texture the host wrote; {} slots made stale by a newer view of other memory there, \
                          {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
                          {} made slots found unmapped and made null",
                         crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
