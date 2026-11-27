@@ -110,7 +110,14 @@ Useful switches under Proton:
 - Frame rate in the first world frames is 0.5-4 fps while the title's pipelines
   are made and its streamed textures are refreshed; the Proton fork reports
   16-19 fps with renderer ports 1, 2, 5, 6 and 7 on and huge pages for port 1's
-  heap. Those ports are off here and not yet re-measured on this GPU.
+  heap.
+- The port-1 path itself works under Wine on this tree: with
+  `VICTORY_PORT_CONSTANTS=1` the log names five private ranges of the 32-bit
+  heap and `linux/thp/victory-thp-collapse` collapsed them ("88 collapsed,
+  0 not"). With all five renderer ports on the same 10-minute run did not reach
+  the world (0.9-1.9 fps, still streaming textures at the end), where the
+  defaults reach it in about three minutes: the ports stay off by default here
+  until each is measured one at a time on this GPU.
 - Ray tracing is off: the structure builder is opt-in (`VICTORY_BVH_BUILDER=1`),
   and without its pipelines the title's ray passes are dropped by design
   (about 330 draws a frame).
