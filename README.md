@@ -42,9 +42,10 @@ that the patched wineserver and the remaining ports attack. Series X stays the
 intended profile; Series S is only a test lever until those costs fall.
 
 Build and run: [`LINUX.md`](LINUX.md). Deterministic sweeps:
-[`tools/linux-sweep/`](tools/linux-sweep/README.md). Frame-time breakdown, port
-status, rejected paths and the wineserver view-tree plan:
-[`docs/linux-research.md`](docs/linux-research.md).
+[`tools/linux-sweep/`](tools/linux-sweep/README.md). Field notes:
+[`docs/linux-research.md`](docs/linux-research.md) (findings by topic),
+[`docs/linux-worklog.md`](docs/linux-worklog.md) (every run, fix, regression and
+measurement), [`docs/linux-handoff.md`](docs/linux-handoff.md).
 
 ## The goal
 
