@@ -1114,6 +1114,11 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 
 /// This thread's processor time so far (user, kernel), in microseconds.
 fn thread_times() -> (u64, u64) {
+    // (`VICTORY_NATIVE_THREAD_TIMES`) Under Wine `GetThreadTimes` is a request to the wineserver and a
+    // read of `/proc`: ~150 a frame on the lane, 70 % of the process's requests (research angle 29).
+    if let Some(times) = crate::linuxmem::thread_times() {
+        return times;
+    }
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };

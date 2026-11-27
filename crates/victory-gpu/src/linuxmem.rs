@@ -15,8 +15,19 @@
 //! - `VICTORY_NATIVE_PRESENT=1`: whether pages can be read by one
 //!   `process_vm_readv` ([`readable`]), where `QueryWorkingSetEx` holds the
 //!   lock over a read of `/proc/self/pagemap`.
+//! - `VICTORY_NATIVE_THREAD_TIMES`: the meters' thread processor time by
+//!   `getrusage(RUSAGE_THREAD)` ([`thread_times`]), where `GetThreadTimes` is
+//!   a wineserver request and a read of `/proc`. Unset: on whenever the
+//!   library is loaded for another switch; `1` loads it for this; `0` off.
+//! - (Not wired in this tree: the calls are here, the guards in `watch` do
+//!   not use them.) `VICTORY_NATIVE_PROTECT=1` (LINUXMEM.md S2a): the guards on told views
+//!   by `mprotect` ([`protect`]), merged over views, where `VirtualProtect`
+//!   holds the lock over the same call, a view at a time.
+//! - `VICTORY_GUARD_UFFD=1` (S2b): the guards on told views by our own
+//!   userfaultfd in async write-protect mode ([`uffd_watch`], [`dirty`]):
+//!   no change of protection, no signal.
 //!
-//! All off by default. Each falls back to the Windows call when we are not
+//! All off by default but the thread times. Each falls back to the Windows call when we are not
 //! under Wine, the library is not there or its probe says the kernel cannot;
 //! one log line each says which way is taken.
 
@@ -25,7 +36,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The library's argument layouts (its `VERSION`).
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const KERNEL_PAGE: usize = 4096;
 /// `PAGE_IS_WRITTEN`, `PAGE_IS_PRESENT` (linux/fs.h).
 const WRITTEN: u64 = 1 << 1;
@@ -86,6 +97,53 @@ struct Readable {
     all: usize,
     there: usize,
     of: usize,
+}
+
+#[repr(C)]
+struct Times {
+    user: u64,
+    kernel: u64,
+    error: isize,
+}
+
+/// A run of pages and the access to them: 1 read-only, 3 read-write.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProtRun {
+    pub at: usize,
+    pub bytes: usize,
+    pub prot: usize,
+}
+
+#[repr(C)]
+struct Protect {
+    runs: *const ProtRun,
+    n: usize,
+    done: usize,
+    error: isize,
+}
+
+#[repr(C)]
+struct Uffd {
+    error: isize,
+    step: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WatchRun {
+    pub at: usize,
+    pub bytes: usize,
+}
+
+#[repr(C)]
+struct Watch {
+    runs: *const WatchRun,
+    n: usize,
+    flags: usize,
+    done: usize,
+    error: isize,
+    step: usize,
 }
 
 type Call = unsafe extern "system" fn(u64, u32, *mut c_void) -> i32;
@@ -183,6 +241,9 @@ struct State {
     direct_pages: bool,
     native_scan: bool,
     native_present: bool,
+    native_times: bool,
+    native_protect: bool,
+    guard_uffd: bool,
 }
 
 fn asked(name: &str) -> bool {
@@ -192,15 +253,55 @@ fn asked(name: &str) -> bool {
 fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| {
-        let wanted = ["VICTORY_DIRECT_PAGES", "VICTORY_NATIVE_SCAN", "VICTORY_NATIVE_PRESENT"].map(asked);
+        let mut wanted = [
+            "VICTORY_DIRECT_PAGES",
+            "VICTORY_NATIVE_SCAN",
+            "VICTORY_NATIVE_PRESENT",
+            "VICTORY_NATIVE_PROTECT",
+            "VICTORY_GUARD_UFFD",
+            "VICTORY_NATIVE_THREAD_TIMES",
+        ]
+        .map(asked);
         // (Not loaded at all with every switch off.)
         let library = if wanted.contains(&true) { load() } else { Err("not asked for".into()) };
+        // The meters' clock: with the library whenever it is there, unless told not to.
+        wanted[5] |= library.is_ok() && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err();
         let caps = library.as_ref().map(|l| l.caps).unwrap_or_default();
-        let can = [library.is_ok(), caps.pagemap_scan != 0, caps.readv != 0];
+        // Our own userfaultfd, opened when asked for: why not, if not.
+        let uffd = match &library {
+            Ok(library) if wanted[4] => {
+                let mut args = Uffd { error: 0, step: 0 };
+                if !library.call(6, &mut args) {
+                    Err("the library's call failed".to_string())
+                } else if args.error != 0 {
+                    let what = if args.step == 1 { "userfaultfd(UFFD_USER_MODE_ONLY)" } else { "UFFDIO_API (async write-protect of shared memory, Linux 6.7)" };
+                    Err(format!("{what} failed, errno {}", -args.error))
+                } else if caps.pagemap_scan == 0 {
+                    Err("no PAGEMAP_SCAN".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(String::new()),
+        };
+        let times = library.as_ref().is_ok_and(|library| {
+            let mut args = Times { user: 0, kernel: 0, error: 0 };
+            library.call(4, &mut args) && args.error == 0
+        });
+        let can = [library.is_ok(), caps.pagemap_scan != 0, caps.readv != 0, library.is_ok(), uffd.is_ok(), times];
+        if let (true, Ok(_), Err(why)) = (wanted[4], &library, &uffd) {
+            tracing::warn!("VICTORY_GUARD_UFFD=1: no userfaultfd of ours: {why}");
+        }
         let said = [
             ("VICTORY_DIRECT_PAGES", "title pages shown by mremap, no wineserver request", "views of the section (MapViewOfFile3)"),
             ("VICTORY_NATIVE_SCAN", "written pages asked of the kernel (PAGEMAP_SCAN), no virtual_mutex", "GetWriteWatch"),
             ("VICTORY_NATIVE_PRESENT", "readable pages asked of the kernel (process_vm_readv), no virtual_mutex", "QueryWorkingSetEx"),
+            // (Port to cool_fox: the library's calls and `protect` / `uffd_watch` /
+            // `dirty` here are whole, but this tree's guards (`watch`) are not
+            // changed to use them; these two switches only probe.)
+            ("VICTORY_NATIVE_PROTECT", "mprotect by the library is there, but this tree's guards do not use it: guards by VirtualProtect as before", "VirtualProtect"),
+            ("VICTORY_GUARD_UFFD", "our own userfaultfd (async write-protect) opened, but this tree's guards do not use it: guards by protection as before", "guards by protection"),
+            ("VICTORY_NATIVE_THREAD_TIMES", "the meters' thread processor time by getrusage(RUSAGE_THREAD), no wineserver request", "GetThreadTimes"),
         ];
         for (i, (name, native, win32)) in said.into_iter().enumerate() {
             match (wanted[i], can[i], &library) {
@@ -214,6 +315,9 @@ fn state() -> &'static State {
             direct_pages: wanted[0] && can[0],
             native_scan: wanted[1] && can[1],
             native_present: wanted[2] && can[2],
+            native_protect: wanted[3] && can[3],
+            guard_uffd: wanted[4] && can[4],
+            native_times: wanted[5] && can[5],
             library: library.ok(),
         }
     })
@@ -233,6 +337,146 @@ pub fn native_scan() -> bool {
 /// Whether [`readable`] answers (`VICTORY_NATIVE_PRESENT=1`, the kernel can).
 pub fn native_present() -> bool {
     state().native_present
+}
+
+/// Whether [`protect`] is for the guards (`VICTORY_NATIVE_PROTECT=1`).
+pub fn native_protect() -> bool {
+    state().native_protect
+}
+
+/// Whether the guards on told views are our userfaultfd's
+/// (`VICTORY_GUARD_UFFD=1`, the kernel can).
+pub fn guard_uffd() -> bool {
+    state().guard_uffd
+}
+
+/// What the guards did, since the last [`guards_line`] (the first two
+/// rows) or since the start: see [`G`].
+pub static GUARDS: [AtomicU64; G::COUNT] = [const { AtomicU64::new(0) }; G::COUNT];
+
+/// The places of [`GUARDS`].
+#[allow(non_snake_case)]
+pub mod G {
+    /// Changes of protection asked of Windows (`VirtualProtect`, under
+    /// `virtual_mutex`), to read-only and back; their blocks (64 KiB).
+    pub const WIN_RO: usize = 0;
+    pub const WIN_RW: usize = 1;
+    pub const WIN_BLOCKS: usize = 2;
+    /// `mprotect` runs of [`super::protect`] to read-only and back; blocks.
+    pub const NATIVE_RO: usize = 3;
+    pub const NATIVE_RW: usize = 4;
+    pub const NATIVE_BLOCKS: usize = 5;
+    /// Runs write-protected by our userfaultfd; their blocks.
+    pub const UFFD_ARMS: usize = 6;
+    pub const UFFD_BLOCKS: usize = 7;
+    /// Runs registered with it; their blocks.
+    pub const UFFD_REGISTERS: usize = 8;
+    pub const UFFD_REGISTERED: usize = 9;
+    /// Askings for written pages of protected runs; KiB walked; ns; 4 KiB
+    /// pages found written; blocks opened for them (what faults were).
+    pub const UFFD_SCANS: usize = 10;
+    pub const UFFD_KIB: usize = 11;
+    pub const UFFD_NS: usize = 12;
+    pub const UFFD_PAGES: usize = 13;
+    pub const UFFD_OPENED: usize = 14;
+    /// Guard faults taken (SIGSEGV to our handler, a block opened).
+    pub const FAULTS: usize = 15;
+    /// Runs the userfaultfd refused (then `mprotect`), runs `mprotect`
+    /// refused (then `VirtualProtect`).
+    pub const UFFD_FELL: usize = 16;
+    pub const NATIVE_FELL: usize = 17;
+    /// Thread times read natively.
+    pub const TIMES: usize = 18;
+    pub const COUNT: usize = 19;
+}
+
+/// Adds to [`GUARDS`].
+pub fn guards_count(what: usize, n: u64) {
+    GUARDS[what].fetch_add(n, Relaxed);
+}
+
+/// [`GUARDS`] since the last line, a frame, for the log.
+pub fn guards_line(frames: f64) -> String {
+    let n: Vec<f64> = GUARDS.iter().map(|n| n.swap(0, Relaxed) as f64 / frames.max(1.0)).collect();
+    let free = n[G::NATIVE_RO] + n[G::NATIVE_RW] + n[G::UFFD_ARMS] + n[G::UFFD_SCANS] + n[G::UFFD_REGISTERS] + n[G::TIMES];
+    format!(
+        "guards by path per frame: VirtualProtect {:.0} read-only + {:.0} back ({:.0} blocks); native mprotect {:.0} + {:.0} runs \
+         ({:.0} blocks); userfaultfd {:.0} runs protected ({:.0} blocks), {:.1} runs registered ({:.1} blocks), {:.0} askings over \
+         {:.0} KiB in {:.2} ms found {:.0} written pages and opened {:.0} blocks; guard faults {:.0}; fallbacks userfaultfd to \
+         mprotect {:.1}, mprotect to VirtualProtect {:.1}; thread times read natively {:.0}; calls without virtual_mutex {:.0}",
+        n[G::WIN_RO],
+        n[G::WIN_RW],
+        n[G::WIN_BLOCKS],
+        n[G::NATIVE_RO],
+        n[G::NATIVE_RW],
+        n[G::NATIVE_BLOCKS],
+        n[G::UFFD_ARMS],
+        n[G::UFFD_BLOCKS],
+        n[G::UFFD_REGISTERS],
+        n[G::UFFD_REGISTERED],
+        n[G::UFFD_SCANS],
+        n[G::UFFD_KIB],
+        n[G::UFFD_NS] / 1e6,
+        n[G::UFFD_PAGES],
+        n[G::UFFD_OPENED],
+        n[G::FAULTS],
+        n[G::UFFD_FELL],
+        n[G::NATIVE_FELL],
+        n[G::TIMES],
+        free
+    )
+}
+
+/// The calling thread's processor time so far (user, kernel) in
+/// microseconds, by one system call of its own (the kernel's exact run
+/// time, split by its ticks; `GetThreadTimes` under Wine gives ticks).
+/// `None`: not on (`VICTORY_NATIVE_THREAD_TIMES`), ask Windows.
+pub fn thread_times() -> Option<(u64, u64)> {
+    let state = state();
+    if !state.native_times {
+        return None;
+    }
+    let mut args = Times { user: 0, kernel: 0, error: 0 };
+    if !state.library.as_ref()?.call(4, &mut args) || args.error != 0 {
+        return None;
+    }
+    GUARDS[G::TIMES].fetch_add(1, Relaxed);
+    Some((args.user, args.kernel))
+}
+
+/// `mprotect` of each run, in order, in one call; `Err`: the error number
+/// of the first that failed (those before it are done). Each run must lie
+/// in mappings of the caller's that Wine believes committed read-write
+/// memory, and stay there for the call; Wine is not told of the change.
+pub fn protect(runs: &[ProtRun]) -> Result<(), (usize, isize)> {
+    let Some(library) = &state().library else { return Err((0, 0)) };
+    let mut args = Protect { runs: runs.as_ptr(), n: runs.len(), done: 0, error: 0 };
+    if !library.call(5, &mut args) {
+        return Err((0, 0));
+    }
+    if args.done < runs.len() { Err((args.done, -args.error)) } else { Ok(()) }
+}
+
+/// With our userfaultfd: registers each run (`register`) and/or
+/// write-protects its pages (`arm`: they read as not written by [`dirty`]
+/// until their next write). `Err`: how many runs were done, the error
+/// number of the next, and whether it was the registering that failed.
+pub fn uffd_watch(runs: &[WatchRun], register: bool, arm: bool) -> Result<(), (usize, isize, bool)> {
+    let Some(library) = &state().library else { return Err((0, 0, true)) };
+    let flags = usize::from(register) | usize::from(arm) << 1;
+    let mut args = Watch { runs: runs.as_ptr(), n: runs.len(), flags, done: 0, error: 0, step: 0 };
+    if !library.call(7, &mut args) {
+        return Err((0, 0, true));
+    }
+    if args.done < runs.len() { Err((args.done, -args.error, args.step == 1)) } else { Ok(()) }
+}
+
+/// The pages of `[base, base + len)` written since [`uffd_watch`] last
+/// protected them, as runs added to `out`; nothing is reset. (Pages of
+/// memory not registered read as written, all of them that are there.)
+pub fn dirty(base: usize, len: usize, out: &mut Vec<(usize, usize)>) -> bool {
+    let Some(library) = &state().library else { return false };
+    len != 0 && scan(library, base, len, WRITTEN, 0, out)
 }
 
 /// What the library's probe found, if it is loaded.

@@ -9,6 +9,10 @@
 //! 1 show      pages of a shared mapping shown at other addresses (`mremap`)
 //! 2 scan      `PAGEMAP_SCAN` of a range: runs of written or present pages
 //! 3 readable  how many 4 KiB pages of a range can be read (`process_vm_readv`)
+//! 4 times     the calling thread's processor time (`getrusage`, no `/proc`)
+//! 5 protect   `mprotect` of runs of pages (guards of ours on title views)
+//! 6 uffd      opens our own userfaultfd (async write-protect); why not
+//! 7 watch     registers runs with it and/or write-protects them
 //!
 //! Each returns 0 and reports in its argument (a negative error number where
 //! a result is expected). Built by `build.sh` beside this file; needs no
@@ -23,10 +27,13 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 /// The layout of the argument structs; the PE side refuses another.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 const OPEN: usize = 2;
+const MPROTECT: usize = 10;
 const IOCTL: usize = 16;
+const GETRUSAGE: usize = 98;
+const USERFAULTFD: usize = 323;
 const MREMAP: usize = 25;
 const MADVISE: usize = 28;
 const GETPID: usize = 39;
@@ -39,6 +46,21 @@ const MADV_POPULATE_WRITE: usize = 23;
 const PAGEMAP_SCAN: usize = 0xc060_6610;
 const PM_SCAN_WP_MATCHING: u64 = 1;
 const PM_SCAN_CHECK_WPASYNC: u64 = 2;
+/// `O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY`.
+const UFFD_OPEN: usize = 0o2000000 | 0o4000 | 1;
+/// `_IOWR(0xAA, 0x3F, struct uffdio_api)`, `_IOWR(0xAA, 0x00, struct
+/// uffdio_register)`, `_IOWR(0xAA, 0x06, struct uffdio_writeprotect)`.
+const UFFDIO_API: usize = 0xc018_aa3f;
+const UFFDIO_REGISTER: usize = 0xc020_aa00;
+const UFFDIO_WRITEPROTECT: usize = 0xc018_aa06;
+/// `UFFD_FEATURE_PAGEFAULT_FLAG_WP | WP_HUGETLBFS_SHMEM | WP_UNPOPULATED |
+/// WP_ASYNC`: a first write to a protected page is settled in the kernel
+/// (no signal, no reader of the descriptor), also in shared memory, and
+/// pages not there yet can be protected.
+const UFFD_FEATURES: u64 = 1 << 0 | 1 << 12 | 1 << 13 | 1 << 15;
+const UFFDIO_REGISTER_MODE_WP: u64 = 2;
+const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
+const RUSAGE_THREAD: usize = 1;
 const EPERM: isize = 1;
 const EBADF: isize = 9;
 const KERNEL_PAGE: usize = 4096;
@@ -46,6 +68,8 @@ const KERNEL_PAGE: usize = 4096;
 /// `/proc/self/pagemap`, opened by [`probe`], never closed; -1: none.
 static PAGEMAP: AtomicI32 = AtomicI32::new(-1);
 static PID: AtomicI32 = AtomicI32::new(0);
+/// Our own userfaultfd, opened by [`uffd`], never closed; -1: none.
+static UFFD: AtomicI32 = AtomicI32::new(-1);
 
 unsafe fn sys6(n: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
     let result: isize;
@@ -319,16 +343,185 @@ unsafe extern "C" fn readable(args: *mut Readable) -> u32 {
     0
 }
 
+#[repr(C)]
+pub struct Times {
+    /// Out: the calling thread's time in user and in kernel mode, in
+    /// microseconds; `error` 0 or a negative error number.
+    user: u64,
+    kernel: u64,
+    error: isize,
+}
+
+/// `getrusage(RUSAGE_THREAD)`: one system call, no other process asked and
+/// no file read (Wine's `GetThreadTimes` is a wineserver request and a read
+/// of `/proc/<pid>/task/<tid>/stat`, in the system's ticks).
+unsafe extern "C" fn times(args: *mut Times) -> u32 {
+    // SAFETY: the caller passes a `Times`; the kernel fills 144 bytes.
+    unsafe {
+        let a = &mut *args;
+        // (`struct rusage`: two `timeval`s, then fourteen longs.)
+        let mut usage = core::mem::MaybeUninit::<[i64; 18]>::uninit();
+        a.error = sys6(GETRUSAGE, RUSAGE_THREAD, usage.as_mut_ptr() as usize, 0, 0, 0, 0);
+        if a.error == 0 {
+            let u = usage.as_ptr().cast::<i64>();
+            a.user = (u.read() * 1_000_000 + u.add(1).read()) as u64;
+            a.kernel = (u.add(2).read() * 1_000_000 + u.add(3).read()) as u64;
+        }
+    }
+    0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProtRun {
+    at: usize,
+    bytes: usize,
+    /// `PROT_READ` 1, `PROT_READ | PROT_WRITE` 3.
+    prot: usize,
+}
+
+#[repr(C)]
+pub struct Protect {
+    runs: *const ProtRun,
+    n: usize,
+    /// Out: runs done; the first failure stops.
+    done: usize,
+    /// Out: 0, or the error number of the run that failed (negative).
+    error: isize,
+}
+
+/// `mprotect` of each run, which may span mappings (views) as Windows'
+/// call may not. Wine is not told: the caller keeps to memory Wine believes
+/// read-write and gives the write access back the same way.
+unsafe extern "C" fn protect(args: *mut Protect) -> u32 {
+    // SAFETY: the caller passes a `Protect` with `n` runs of memory it owns.
+    unsafe {
+        let a = &mut *args;
+        (a.done, a.error) = (0, 0);
+        for i in 0..a.n {
+            let run = *a.runs.add(i);
+            let got = sys6(MPROTECT, run.at, run.bytes, run.prot & 3, 0, 0, 0);
+            if got != 0 {
+                a.error = got;
+                return 0;
+            }
+            a.done += 1;
+        }
+    }
+    0
+}
+
+#[repr(C)]
+pub struct Uffd {
+    /// Out: 0 if our userfaultfd is open with async write-protect for
+    /// shared memory; else the error number (negative), and `step` says of
+    /// what: 1 `userfaultfd`, 2 `UFFDIO_API`.
+    error: isize,
+    step: usize,
+}
+
+unsafe extern "C" fn uffd(args: *mut Uffd) -> u32 {
+    // SAFETY: the caller passes a `Uffd`.
+    unsafe {
+        let a = &mut *args;
+        (a.error, a.step) = (0, 0);
+        if UFFD.load(Relaxed) >= 0 {
+            return 0;
+        }
+        let fd = sys6(USERFAULTFD, UFFD_OPEN, 0, 0, 0, 0, 0);
+        if fd < 0 {
+            (a.error, a.step) = (fd, 1);
+            return 0;
+        }
+        // `struct uffdio_api { api, features, ioctls }`.
+        let mut api = [0xAAu64, UFFD_FEATURES, 0];
+        let got = sys6(IOCTL, fd as usize, UFFDIO_API, api.as_mut_ptr() as usize, 0, 0, 0);
+        if got < 0 || api[1] & UFFD_FEATURES != UFFD_FEATURES {
+            (a.error, a.step) = (if got < 0 { got } else { -EPERM }, 2);
+            // (Left open: no `close` worth a constant; once a process.)
+            return 0;
+        }
+        // (Two threads at once leave a descriptor open: no harm.)
+        UFFD.store(fd as i32, Relaxed);
+    }
+    0
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WatchRun {
+    at: usize,
+    bytes: usize,
+}
+
+#[repr(C)]
+pub struct Watch {
+    runs: *const WatchRun,
+    n: usize,
+    /// Bit 0: register each run with our userfaultfd (write-protect mode).
+    /// Bit 1: write-protect its pages (those not there too): each reads as
+    /// not written ([`scan`], no flags) until its next write, which the
+    /// kernel settles itself. A page the kernel drops after a write has no
+    /// entry and reads as written; a protected one keeps a marker.
+    flags: usize,
+    /// Out: runs done; the first failure stops.
+    done: usize,
+    /// Out: 0, or the error number of the run that failed (negative);
+    /// `step`: 1 registering, 2 protecting.
+    error: isize,
+    step: usize,
+}
+
+unsafe extern "C" fn watch(args: *mut Watch) -> u32 {
+    // SAFETY: the caller passes a `Watch` with `n` runs of mappings it owns.
+    unsafe {
+        let a = &mut *args;
+        (a.done, a.error, a.step) = (0, 0, 0);
+        let fd = UFFD.load(Relaxed);
+        if fd < 0 {
+            (a.error, a.step) = (-EBADF, 1);
+            return 0;
+        }
+        for i in 0..a.n {
+            let run = *a.runs.add(i);
+            if a.flags & 1 != 0 {
+                // `struct uffdio_register { range { start, len }, mode, ioctls }`.
+                let mut reg = [run.at as u64, run.bytes as u64, UFFDIO_REGISTER_MODE_WP, 0];
+                let got = sys6(IOCTL, fd as usize, UFFDIO_REGISTER, reg.as_mut_ptr() as usize, 0, 0, 0);
+                if got < 0 {
+                    (a.error, a.step) = (got, 1);
+                    return 0;
+                }
+            }
+            if a.flags & 2 != 0 {
+                // `struct uffdio_writeprotect { range { start, len }, mode }`.
+                let mut wp = [run.at as u64, run.bytes as u64, UFFDIO_WRITEPROTECT_MODE_WP];
+                let got = sys6(IOCTL, fd as usize, UFFDIO_WRITEPROTECT, wp.as_mut_ptr() as usize, 0, 0, 0);
+                if got < 0 {
+                    (a.error, a.step) = (got, 2);
+                    return 0;
+                }
+            }
+            a.done += 1;
+        }
+    }
+    0
+}
+
 type Call = unsafe extern "C" fn(*mut core::ffi::c_void) -> u32;
 
 /// Wine's table of a unix library's calls.
 #[unsafe(no_mangle)]
-pub static __wine_unix_call_funcs: [Call; 4] = unsafe {
+pub static __wine_unix_call_funcs: [Call; 8] = unsafe {
     // SAFETY: each takes one pointer; Wine passes the caller's.
     [
         core::mem::transmute::<unsafe extern "C" fn(*mut Caps) -> u32, Call>(probe),
         core::mem::transmute::<unsafe extern "C" fn(*mut Show) -> u32, Call>(show),
         core::mem::transmute::<unsafe extern "C" fn(*mut Scan) -> u32, Call>(scan),
         core::mem::transmute::<unsafe extern "C" fn(*mut Readable) -> u32, Call>(readable),
+        core::mem::transmute::<unsafe extern "C" fn(*mut Times) -> u32, Call>(times),
+        core::mem::transmute::<unsafe extern "C" fn(*mut Protect) -> u32, Call>(protect),
+        core::mem::transmute::<unsafe extern "C" fn(*mut Uffd) -> u32, Call>(uffd),
+        core::mem::transmute::<unsafe extern "C" fn(*mut Watch) -> u32, Call>(watch),
     ]
 };
