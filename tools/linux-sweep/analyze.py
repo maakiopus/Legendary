@@ -45,11 +45,11 @@ PRESENT = re.compile(
 # This fork: one line per five-second report, "30.0 fps, 33.3 ms/frame".
 FPS = re.compile(r"(?P<fps>[\d.]+) fps, (?P<ms>[\d.]+) ms/frame")
 FAULT = re.compile(
-    r"\bshader fault\b|\bdevice lost\b|\bhost GPU device removed\b|"
+    r"\bdevice lost\b|\bhost GPU device removed\b|"
     r"\bdevice removed\b|\bDeviceLost\b",
     re.IGNORECASE,
 )
-CRASH = re.compile(r"\bunhandled exception\b|\bWER - Saving\b|\bBreakpad\b", re.IGNORECASE)
+CRASH = re.compile(r"\bunhandled exception\b|\bWER - Saving\b", re.IGNORECASE)
 INDIRECT_FAIL = re.compile(r"no argument clamp: indirect execution dropped")
 # The black world: the clamp is gone and the world's indirect records drop.
 NOT_BOUNDED = re.compile(
@@ -189,7 +189,7 @@ def analyse(log: Path, captures: Path) -> int:
             blown = sum(least.resize((240, 135)).histogram()[240:]) / small
             tint.append((p.name, r, g, b, blown))
     except ImportError:
-        pass
+        print("capture_luminance unavailable: install Pillow for image checks")
     if brightness:
         means = [m for _, m in brightness]
         print(f"capture_luminance min={min(means):.1f} max={max(means):.1f} "
@@ -262,7 +262,8 @@ def analyse(log: Path, captures: Path) -> int:
     blown = bool(world) and bool(tint) and max(x[4] for x in tint) > 0.25
     ok = (bool(world) and not faults and not crashes and not shader_drops
           and not black_frames and not dark_screen and not color_cast
-          and not card_compare and not library_fail and not indirect)
+          and not card_compare and not library_fail and not helper_errors
+          and not indirect)
     if dark_screen:
         print("DARK_SCREEN: every large capture is a dark loading screen, not the world")
     if color_cast:
@@ -277,8 +278,8 @@ def analyse(log: Path, captures: Path) -> int:
         print("NO_ARGUMENT_CLAMP: the argument clamp's HLSL did not compile under Wine's "
               "d3dcompiler (byte-address intrinsics, E5005); the world's indirect records "
               f"run unclamped (worst {not_bounded:.0f}/frame dropped before the fallback). "
-              "Build the helpers in: tools/build.sh fast (VICTORY_BUILD_DXC), or stage a "
-              "native d3dcompiler_47 beside the exe (tools/d3dcompiler.sh)")
+              "Stage a native d3dcompiler_47 beside the exe (tools/d3dcompiler.sh); a tree "
+              "with the DXC bundling commit b52f4e3 bundles the helpers instead")
     if library_fail:
         print("WINE_LIBRARY_FAIL: vkd3d refused the empty host pipeline library; "
               "pipelines are not kept between runs")

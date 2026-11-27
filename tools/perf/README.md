@@ -9,8 +9,13 @@ and the card's work. `tools/perf/perf-run.sh` starts it beside a sweep:
 sudo tools/perf/perf-run.sh SWEEP_LABEL=slow ./tools/linux-sweep/run.sh
 ```
 
-Output lands beside the sweep's (`/tmp/opencode/sweep-<label>/stalls.txt`),
-with the widest stalls echoed at the end.
+Output lands beside the sweep's (`/tmp/opencode/sweep-<label>/stalls.txt`;
+the label defaults to the sweep's own `sweep`), with the widest stalls
+echoed at the end. Every printed line is stamped with a `time("%H:%M:%S ")`
+prefix, and `perf-run.sh` runs bpftrace with `TZ=UTC`, the clock `app.log`
+and `perf-report.md` use, so a stall is matched to the sweep's five-second
+windows and spike windows. The one-second sums print their stamp
+on its own line first, so the block after a stamp is that second's sums.
 
 ## What each trace answers
 
@@ -26,6 +31,29 @@ with the widest stalls echoed at the end.
 Requires bpftrace and root (or `setcap cap_sys_bpf` on it). The counts are
 sampled sums, one line a second — the biggest number of the second is the
 wall to split.
+
+`amdgpu_vm_fault` is absent on some kernels (7.3.6 here). `perf-run.sh`
+leaves that probe out of the runnable copy when the event is missing; a
+manual `bpftrace tools/perf/stalls.bt` needs the same edit or the whole
+script aborts on the unmatched tracepoint.
+
+## The sweep's frame-time report
+
+When `tools/linux-sweep/perf.py` exists, `run.sh` runs it after the verdict
+against the same app log and captures. It writes four files into the sweep
+dir — `frametimes.csv` (one frame a row), `spikes.json` (the spike trace),
+`perf-summary.json` (the machine-readable summary) and `perf-report.md`
+(the readable report) — and tees a short summary into the sweep output.
+`perf-summary.json` carries `windows`, `median_ms`, `p95_ms`, `p99_ms`,
+`last_fps`, `spikes`, `top_stall` and `spike_windows`; `ab.py` picks up
+`median_ms`, `p95_ms`, `p99_ms`, `spikes` and `top_stall` as extra columns
+whenever the summary is present (a dash otherwise).
+
+The report's spike windows are five-second windows, the same granularity as
+the present/fps windows `analyze.py` prints, and the stall tracer's stamps
+(`stalls.bt`, `time("%H:%M:%S ")`) are on the same wall clock — a spike
+window names the seconds, `stalls.txt` names what the kernel saw in them,
+and `perf-report.md` reads the two against each other.
 
 ## A debug trace of a lost device
 

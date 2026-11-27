@@ -22,12 +22,19 @@
 //   the write watch; a flood of them outside a bake or a load is a
 //   mapping gone wrong.
 //
+// Every printed line carries a wall-clock `time("%H:%M:%S ")` stamp, so a
+// stall can be matched to the sweep's five-second fps/present windows in
+// app.log and the spike windows in perf-report.md. The one-second sums
+// print their stamp on its own line first (bpftrace map prints cannot be
+// prefixed), so the block after a stamp is that second's sums.
+//
 // For a debugger's own trace of a dead device, the diagnostics build with
 // VICTORY_D3D12_DEBUG=1 names the command the removal was in
 // (`docs/linux-worklog.md`); the sweep's `SWEEP_DEBUG=1` sets both.
 
 BEGIN
 {
+    time("%H:%M:%S ");
     printf("stalls: futex waits over 1 ms and syscalls over 5 ms of the run's processes, sums a second\n");
 }
 
@@ -47,6 +54,7 @@ tracepoint:syscalls:sys_exit_futex
     if ($took > 1000) {
         @futex_us[comm] = sum($took);
         if ($took > 10000) {
+            time("%H:%M:%S ");
             printf("%-16s tid %-6d futex wait %d us\n", comm, tid, $took);
         }
     }
@@ -55,7 +63,7 @@ tracepoint:syscalls:sys_exit_futex
 
 // The long syscalls, one pair of clauses each: enter marks, exit tells.
 tracepoint:syscalls:sys_enter_mmap
-/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+/str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
 { @mmap_start[tid] = nsecs; }
 tracepoint:syscalls:sys_exit_mmap
 /@mmap_start[tid]/
@@ -66,7 +74,7 @@ tracepoint:syscalls:sys_exit_mmap
 }
 
 tracepoint:syscalls:sys_enter_munmap
-/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+/str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
 { @munmap_start[tid] = nsecs; }
 tracepoint:syscalls:sys_exit_munmap
 /@munmap_start[tid]/
@@ -77,7 +85,7 @@ tracepoint:syscalls:sys_exit_munmap
 }
 
 tracepoint:syscalls:sys_enter_mprotect
-/@str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
+/str(comm) == "victory.exe" || str(comm) == "cmd.exe" || str(comm) == "wineserver"/
 { @mprotect_start[tid] = nsecs; }
 tracepoint:syscalls:sys_exit_mprotect
 /@mprotect_start[tid]/
@@ -88,7 +96,7 @@ tracepoint:syscalls:sys_exit_mprotect
 }
 
 tracepoint:syscalls:sys_enter_ioctl
-/@str(comm) == "victory.exe" || str(comm) == "wineserver"/
+/str(comm) == "victory.exe" || str(comm) == "wineserver"/
 { @ioctl_start[tid] = nsecs; }
 tracepoint:syscalls:sys_exit_ioctl
 /@ioctl_start[tid]/
@@ -97,6 +105,7 @@ tracepoint:syscalls:sys_exit_ioctl
     if ($took > 5000) {
         @ioctl_us[comm] = sum($took);
         if ($took > 20000) {
+            time("%H:%M:%S ");
             printf("%-16s tid %-6d ioctl %d us\n", comm, tid, $took);
         }
     }
@@ -115,9 +124,10 @@ tracepoint:amdgpu:amdgpu_vm_fault
     @vm_faults[comm] = count();
 }
 
-// One line a second: the sums of the second, then cleared.
+// One line a second: a stamp, then the sums of that second, cleared.
 interval:s:1
 {
+    time("%H:%M:%S\n");
     print(@futex_us);
     print(@mmap_us);
     print(@munmap_us);
@@ -132,6 +142,8 @@ interval:s:1
 
 END
 {
+    print(@cs);
+    print(@vm_faults);
     clear(@futex_start);
     clear(@mmap_start);
     clear(@munmap_start);

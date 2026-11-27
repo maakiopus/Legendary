@@ -3,7 +3,7 @@
 #
 # Every sweep uses identical Proton, keys, capture points and duration, so
 # results from different commits and different agents are comparable.
-# No system Wine is used at any point: only umu-run + Proton Experimental.
+# No system Wine is used at any point: only umu-run + GE-Proton11-14-vt.
 #
 # Ported from victory-royale tools/linux-sweep/run.sh. This fork's title
 # command is `victory run <exe> --execute --console <profile>`; the binary
@@ -14,13 +14,13 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 LABEL=${SWEEP_LABEL:-sweep}
 WORK=/tmp/opencode/sweep-$LABEL
 EXE=${SWEEP_EXE:-$ROOT/target/x86_64-pc-windows-msvc/diag/victory.exe}
-# The helpers (card compare, up check, argument clamps) only DXC compiles:
-# without them the world's indirect records drop (`tools/d3dcompiler.sh`).
+# The helpers (card compare, up check, argument clamps) only DXC or a native
+# Microsoft d3dcompiler_47 compiles: without them the world's indirect
+# records drop (`tools/d3dcompiler.sh`).
 source "$ROOT/tools/d3dcompiler.sh"
-source "$ROOT/tools/dxc.sh"
 GAME=${SWEEP_GAME:-Z:\\media\\SSD\\GTA6.Xbox.v1.0.2.1-CYBERLEEK\\game_scarlett_master.exe}
 CONSOLE=${SWEEP_CONSOLE:-series-x}
-PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/Proton - Experimental}
+PROTON=${PROTONPATH:-$HOME/.local/share/Steam/steamapps/common/GE-Proton11-14-vt}
 DURATION=${SWEEP_DURATION:-660}
 # A shared cache outside the tree: the shader cache survives runs, and no
 # game-derived output is written below the repository root (docs/asset-policy).
@@ -39,8 +39,9 @@ fi
 if ! dxil_bundled "$EXE" && ! d3dcompiler_native "$EXE"; then
     echo "sweep: the exe has no helper shaders and no native d3dcompiler beside it;" >&2
     echo "       under Wine the clamp fails and the world draws black. Fix either:" >&2
-    echo "         tools/build.sh fast   (builds with dxc, the helpers bundled)" >&2
-    echo "         or stage d3dcompiler_47 beside the exe (tools/d3dcompiler.sh)" >&2
+    echo "         stage d3dcompiler_47 beside the exe (tools/d3dcompiler.sh)" >&2
+    echo "         or restore the DXC bundling commit b52f4e3 and rebuild" >&2
+    echo "         (tools/build.sh fast then bundles the helpers)" >&2
     if [ "${SWEEP_NO_GUARDS:-0}" != 1 ]; then
         echo "sweep: refusing to run (SWEEP_NO_GUARDS=1 runs it anyway, for a black world)" >&2
         exit 2
@@ -60,8 +61,6 @@ command -v umu-run >/dev/null 2>&1 || { echo "sweep: no umu-run on the path" >&2
 if [ "${SWEEP_DEBUG:-0}" = 1 ]; then
     LOG_FILTER=debug
 fi
-DXC=$(find_dxc || true)
-echo "dxc: ${DXC:-none} (the build bundles the helpers with it; tools/build.sh fast does)"
 [ "${SWEEP_DEBUG:-0}" = 1 ] && echo "sweep: debug mode (VICTORY_LOG=debug, VICTORY_D3D12_DEBUG=1)"
 
 mkdir -p "$WORK" "$WORK/capture" "$CACHE"
@@ -114,11 +113,15 @@ export PROTONPATH="$PROTON"
 export STEAM_COMPAT_INSTALL_PATH=${STEAM_COMPAT_INSTALL_PATH:-$HOME/.local/share/Steam/steamapps/common/victory-run}
 export STEAM_COMPAT_LIBRARY_PATHS=${STEAM_COMPAT_LIBRARY_PATHS:-$HOME/.local/share/Steam/steamapps}
 
-# The default compat path must be a symlink to the binary's directory.
+# The compat path must be a symlink to the binary's directory. Replace a
+# symlink in place; never delete a real directory a user set.
 mkdir -p "$(dirname "$STEAM_COMPAT_INSTALL_PATH")"
-if [ ! -L "$STEAM_COMPAT_INSTALL_PATH" ] || [ "$(readlink -f "$STEAM_COMPAT_INSTALL_PATH")" != "$(dirname "$EXE")" ]; then
-    rm -rf "$STEAM_COMPAT_INSTALL_PATH"
+if [ -L "$STEAM_COMPAT_INSTALL_PATH" ]; then
+    ln -sfn "$(dirname "$EXE")" "$STEAM_COMPAT_INSTALL_PATH"
+elif [ ! -e "$STEAM_COMPAT_INSTALL_PATH" ]; then
     ln -s "$(dirname "$EXE")" "$STEAM_COMPAT_INSTALL_PATH"
+else
+    echo "sweep: keeping the existing $STEAM_COMPAT_INSTALL_PATH (not a symlink)" >&2
 fi
 
 echo "sweep=$LABEL exe=$EXE game=$GAME console=$CONSOLE duration=${DURATION}s"
@@ -129,7 +132,18 @@ echo "umu_exit=$umu"
 
 # The verdict, and the one line that says what the run was: nothing is
 # diagnosed twice.
-if python3 "$ROOT/tools/linux-sweep/analyze.py" --log "$LOG" --captures "$WORK/capture" | tee "$WORK/verdict.txt"; then
-    :
+python3 "$ROOT/tools/linux-sweep/analyze.py" --log "$LOG" --captures "$WORK/capture" | tee "$WORK/verdict.txt"
+verdict_rc=${PIPESTATUS[0]}
+# The frame-time report from perf.py, when it exists: frametimes.csv,
+# spikes.json, perf-summary.json and perf-report.md land in the sweep dir,
+# and its short summary is teed into the sweep output. A perf.py error
+# never fails the sweep — the verdict above stands.
+PERF="$ROOT/tools/linux-sweep/perf.py"
+if [ -f "$PERF" ]; then
+    echo "perf report: $PERF -> $WORK/{frametimes.csv,spikes.json,perf-summary.json,perf-report.md}"
+    if ! python3 "$PERF" --log "$LOG" --captures "$WORK/capture" --out "$WORK" 2>&1 | tee "$WORK/perf.txt"; then
+        echo "perf: perf.py failed — the sweep verdict above stands" >&2
+    fi
 fi
-grep -q "no argument clamp" "$LOG" 2>/dev/null && echo "hint: the helpers are not in the exe — tools/build.sh fast builds them in"
+grep -q "no argument clamp" "$LOG" 2>/dev/null && echo "hint: the helpers are not in the exe — stage a modern d3dcompiler_47 beside it (tools/d3dcompiler.sh)"
+exit "$verdict_rc"

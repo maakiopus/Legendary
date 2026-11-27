@@ -11,6 +11,7 @@ the verdict lines, and prints one table so a before/after is read at a glance.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -40,20 +41,30 @@ METRICS = [
     ("present", re.compile(r"^last_window (.+)$")),
 ]
 
+# The frame-time columns come from the sweep dir's perf-summary.json (written
+# by perf.py); a sweep without one shows a dash.
+PERF_KEYS = ("median_ms", "p95_ms", "p99_ms", "spikes", "top_stall")
+
 
 def resolve(argument: str) -> Path:
     direct = Path(argument)
     if (direct / "app.log").exists():
         return direct
+    if direct.is_dir():
+        raise SystemExit(f"no app.log under {direct}")
     return LABEL_ROOT / f"sweep-{argument}"
 
 
 def analyse(directory: Path) -> dict[str, str]:
-    output = subprocess.run(
+    result = subprocess.run(
         [sys.executable, str(ANALYZE), "--log", str(directory / "app.log"),
          "--captures", str(directory / "capture")],
         capture_output=True, text=True, check=False,
-    ).stdout
+    )
+    if result.returncode != 0 and "VERDICT=" not in result.stdout:
+        print(f"warn: analyze.py failed for {directory} (rc={result.returncode}): "
+              f"{result.stderr.strip()[:300]}", file=sys.stderr)
+    output = result.stdout
     found: dict[str, str] = {}
     for line in output.splitlines():
         for name, pattern in METRICS:
@@ -63,6 +74,26 @@ def analyse(directory: Path) -> dict[str, str]:
                 found[name] = " ".join(match.groups()) if len(match.groups()) > 1 else match.group(1)
     for name, _ in METRICS:
         found.setdefault(name, "-")
+    return found
+
+
+def load_perf(directory: Path) -> dict[str, str]:
+    found: dict[str, str] = dict.fromkeys(PERF_KEYS, "-")
+    summary = directory / "perf-summary.json"
+    if not summary.is_file():
+        return found
+    try:
+        data = json.loads(summary.read_text())
+    except (OSError, ValueError):
+        return found
+    if not isinstance(data, dict):
+        return found
+    for key in PERF_KEYS:
+        value = data.get(key)
+        if isinstance(value, (int, float)):
+            found[key] = f"{value:g}"
+        elif value is not None:
+            found[key] = str(value)
     return found
 
 
@@ -78,12 +109,14 @@ def main() -> int:
         if not (directory / "app.log").exists():
             print(f"no app.log under {directory}", file=sys.stderr)
             return 2
-        columns.append((argument, analyse(directory)))
-    width = max(len(name) for name, _ in METRICS) + 2
-    header = "".ljust(width) + "".join(label.ljust(24) for label, _ in columns)
+        columns.append((argument, analyse(directory) | load_perf(directory)))
+    rows = [name for name, _ in METRICS] + list(PERF_KEYS)
+    width = max(len(name) for name in rows) + 2
+    cell = 28
+    header = "".ljust(width) + "".join(label.ljust(cell) for label, _ in columns)
     print(header)
-    for name, _ in METRICS:
-        print(name.ljust(width) + "".join(values[name].ljust(24) for _, values in columns))
+    for name in rows:
+        print(name.ljust(width) + "".join(values[name][:cell - 1].ljust(cell) for _, values in columns))
     return 0
 
 
