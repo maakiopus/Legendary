@@ -3128,13 +3128,15 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
 /// process-wide lock every thread of ours queues at. Regions become memory
 /// through the runtime ([`title_memory_remapped`]) or `XMemVirtualAlloc`
 /// ([`title_memory_allocated`]), which drop what they cover; every 8 frames
-/// everything is asked again, for any other way. `VICTORY_ABSENT_CACHE=0`:
-/// asked every time.
+/// everything is asked again, for any other way. `VICTORY_ABSENT_CACHE=1`:
+/// on. Off by default: a Proton run of this tree with it on stayed at the
+/// start screen where the same binary without it reached the world, so a
+/// path that makes memory without telling this file is still to be found.
 static UNCOMMITTED: Mutex<(BTreeMap<usize, usize>, u64)> = Mutex::new((BTreeMap::new(), u64::MAX));
 
 fn absent_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_CACHE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_CACHE").is_some_and(|v| v == "1"))
 }
 
 /// Drops the remembered uncommitted regions that touch blocks `[first, last)`.
