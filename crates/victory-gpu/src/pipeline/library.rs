@@ -462,9 +462,25 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library is asked for with a null blob. The binding
+        // passes an empty slice's dangling pointer, which Windows takes as
+        // empty but vkd3d-proton refuses (E_INVALIDARG with a pointer and
+        // a length of 0), leaving no library at all under Wine.
+        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        let mut library = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); the out
+        // pointer is ours and holds a library of the asked interface on
+        // success.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                device.as_raw(),
+                blob,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut library,
+            )
+            .and_then(|| windows::core::Type::from_abi(library))
+            .and_then(|library: ID3D12PipelineLibrary| library.cast())
         }
     };
     if !blob.bytes().is_empty() {
