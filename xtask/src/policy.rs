@@ -18,6 +18,8 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
     // The huge-pages helper of linux/thp: a page collapser, no game data.
     "c",
+    // Packaging and kernel tracing: plain text tooling, no game data.
+    "patch", "bt", "conf", "install",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -25,6 +27,7 @@ const ALLOWED_NAMES: &[&str] = &[
     ".editorconfig",
     ".victory-root",
     "pre-commit",
+    "PKGBUILD",
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -43,6 +46,14 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     (
         "tools/linux-sweep/ab.py",
         "the Linux sweep's before/after comparison: plain text tooling, no build step; `py` is not a general extension (tools/linux-sweep/README.md)",
+    ),
+    (
+        "tools/linux-sweep/perf.py",
+        "the Linux sweep's frame-time report: plain text tooling, no build step; `py` is not a general extension (tools/linux-sweep/README.md)",
+    ),
+    (
+        "linux/pkgbuild/wine-proton-ge/user_settings.py",
+        "the Proton-GE package's settings: plain text tooling, no build step; `py` is not a general extension (linux/pkgbuild/README.md)",
     ),
 ];
 
