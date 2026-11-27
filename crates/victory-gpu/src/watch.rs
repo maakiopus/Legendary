@@ -865,7 +865,10 @@ fn view_ask() -> bool {
     if !VIEW_ASK_IN_TEST.get() {
         return false;
     }
-    crate::toggled!("VICTORY_VIEW_ASK")
+    // Off by default: skipping the kernel's answer crashed the title in two
+    // Proton runs (Breakpad, exit 99) where the same binary with the skip
+    // off was PASS; `VICTORY_VIEW_ASK=1` turns it on for A/B.
+    std::env::var_os("VICTORY_VIEW_ASK").is_some_and(|v| v == "1")
 }
 
 #[cfg(test)]
