@@ -1764,26 +1764,50 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// slots whose texture is away, which are asked again and again). So a
+/// texture of which only blocks between its ends are mapped reads as none:
+/// [`mapped_bytes_between`] makes sure.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    if let Some(there) = viewed_bytes(start, len) {
+        return there;
+    }
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+        return 0;
+    }
+    mapped_bytes_between(at, len)
+}
+
+/// What views of physical pages show of `[at, at + len)`, where the runtime's
+/// record says which are there: one look, where the host was asked for every
+/// 64 KiB of the texture (and once more for each that is not there).
+/// `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
+fn viewed_bytes(at: usize, len: usize) -> Option<u64> {
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    crate::inplace::shown_bytes(at, len)
+}
+
+/// [`mapped_bytes`] without its look at the ends first: every block (or
+/// page, or run) of `[at, at + len)` is asked, unless views of physical
+/// pages already show it (`viewed_bytes`: those answers are never worse
+/// than a scan of the title's own pages). For an answer of none that
+/// undoes something, as the host copy of a texture on the card.
+pub(crate) fn mapped_bytes_between(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    // Streamed textures lie in views of physical pages, of which the runtime
-    // knows which are there: one look, where the host was asked for every
-    // 64 KiB of the texture (and once more for each that is not there).
-    // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
-    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
-        && let Some(there) = crate::inplace::shown_bytes(start, len)
-    {
+    if let Some(there) = viewed_bytes(start, len) {
         return there;
-    }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
     }
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1940,6 +1964,41 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::{mapped_bytes, mapped_bytes_between};
+
+    /// A texture whose ends are not mapped and some blocks between them
+    /// are reads as none by its ends and as those blocks when every block
+    /// is asked; one not mapped at all is none both ways, and one mapped
+    /// whole is all of it both ways.
+    #[test]
+    fn blocks_mapped_between_unmapped_ends_are_found_when_every_block_is_asked() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const SIZE: usize = 16 * BLOCK;
+        // SAFETY: a private reservation of our own, read only through the
+        // queries and the kernel.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes(base, SIZE), 0);
+            assert_eq!(mapped_bytes_between(base, SIZE), 0);
+            let middle = base.add(5 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert_eq!(mapped_bytes(base, SIZE), 0, "the ends alone say none");
+            assert_eq!(mapped_bytes_between(base, SIZE), 2 * BLOCK as u64);
+            // Unmapped again: none both ways.
+            assert_ne!(VirtualFree(middle.cast(), 2 * BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(mapped_bytes_between(base, SIZE), 0);
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
+            assert_eq!(mapped_bytes_between(base, SIZE), SIZE as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[cfg(test)]

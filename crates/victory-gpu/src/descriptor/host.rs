@@ -1095,18 +1095,30 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
+    /// the order to serve them, in turns of one of each kind while both
+    /// last:
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), first: the look is a query, and memory that has
     ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
+    /// - the others, the newest write first and the oldest next, in
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
+    ///
+    /// All the looked-at ones ahead of the rest gave none of the others a
+    /// look while more than `max` of them were due, or more than a pass
+    /// reaches before it runs out of time or bytes.
+    ///
+    /// Without `room` on the card, all the looked-at ones still come first,
+    /// as before: the pass then makes no new host texture, and stops after
+    /// 1024 slots it cannot make one for (256 with
+    /// `VICTORY_FULL_CARD_PASS=0`), so first looks taken in turns would
+    /// spend that count before it reached the looked-at slots it can still
+    /// serve.
     #[cfg(test)]
-    fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        Self::in_order(self.all_due(frame), max)
+    fn due(&self, frame: u64, max: usize, room: bool) -> Vec<(u32, u64)> {
+        Self::in_order(self.all_due(frame), max, room)
     }
 
     /// The slots due at `frame`, for [`TextureQueue::in_order`].
@@ -1119,21 +1131,29 @@ impl TextureQueue {
     }
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
-    fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
+    /// ten thousand slots are sorted); `room`: see [`TextureQueue::due`].
+    fn in_order([mut again, mut fresh]: Due, max: usize, room: bool) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut again = again.iter().map(|&(_, index, write)| (index, write));
+        // The newest write and the oldest next, in turns.
+        let n = fresh.len();
+        let mut fresh = (0..n)
+            .map(|i| fresh[if i % 2 == 0 { i / 2 } else { n - 1 - i / 2 }])
+            .map(|(_, index, write)| (index, write));
+        if !room {
+            return again.chain(fresh).take(max).collect();
+        }
+        let mut order = Vec::new();
+        while order.len() < max {
+            let (a, f) = (again.next(), fresh.next());
+            if a.is_none() && f.is_none() {
+                break;
             }
+            order.extend(a);
+            order.extend(f);
         }
         order.truncate(max);
         order
@@ -1934,14 +1954,14 @@ impl HostHeap {
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
     /// with its write number, in the order to serve them
-    /// ([`TextureQueue::due`]), and the queue's counts
-    /// ([`TextureQueue::census`]).
-    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+    /// ([`TextureQueue::due`], `room`: whether the card has room for new
+    /// host textures), and the queue's counts ([`TextureQueue::census`]).
+    pub(crate) fn texture_slots_due(&self, frame: u64, max: usize, room: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
         let (due, census) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
-        (TextureQueue::in_order(due, max), census)
+        (TextureQueue::in_order(due, max, room), census)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -2266,10 +2286,25 @@ impl HostHeap {
         remade
     }
 
+    /// The record host slot `index` is made from, if it is a view of the
+    /// placed texture `view` is: `view` itself, or an older view of the same
+    /// texture that [`HostHeap::mirror`] keeps showing until the new one is
+    /// made (`same_placed_texture`). Also a record no longer there (the slot
+    /// is stale whatever it was). `None` for a slot made from nothing, or
+    /// from another texture (a draw made it anew since `view` was read).
+    pub(crate) fn texture_slot_made_of(&self, index: u32, view: &View) -> Option<u64> {
+        let _made = self.made.lock(index);
+        let key = self.made.get(index)?;
+        (key != 0 && view_at(key as u32, (key >> 32) as u32).is_none_or(|old| same_placed_texture(&old, view)))
+            .then_some(key)
+    }
+
     /// The memory of the texture title slot `index` views is not mapped
-    /// (any more): a host slot made from it becomes null again, so that
-    /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
-    /// keeps what it views). True if the slot was made.
+    /// (any more): host slot `index`, if it is still made from `key` (what
+    /// [`HostHeap::texture_slot_made_of`] said, not a view made there
+    /// since), becomes null again, so that the host copy can be let go
+    /// (`crate::resource::let_go_idle`; a slot keeps what it views). True
+    /// if it did.
     ///
     /// Not at the first look: a title that moves a texture in its streaming
     /// memory unmaps it before it maps it again, and what was shown went
@@ -2277,16 +2312,16 @@ impl HostHeap {
     /// books, posters and sleeves for 0.3 to 2 s). Only when it is still
     /// away `AWAY_MS` after it was first found away
     /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+    pub(crate) fn texture_slot_gone(&self, index: u32, key: u64) -> bool {
         const AWAY_MS: u64 = 3000;
         static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let wait = *WAIT.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
         });
         let _made = self.made.lock(index);
-        let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
+        if key == 0 || self.made.get(index) != Some(key) {
             return false;
-        };
+        }
         let now = crate::host::now_ms();
         {
             let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
@@ -5375,6 +5410,64 @@ mod tests {
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
     }
 
+    /// The texture pass lets a slot's host copy go only while the slot is
+    /// made from the texture whose memory it found unmapped: an older view
+    /// of that texture the slot keeps showing counts; a view of other
+    /// memory a draw made there after the pass read the slot does not.
+    #[test]
+    fn a_slot_is_let_go_only_while_made_from_the_texture_found_unmapped() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let view = |address: u64, first_mip: u32| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[4], desc[5]) = (98, 4, first_mip, 7 - first_mip);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x7_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let key = |view: View| {
+            let [i, generation] = crate::descriptor::words_for(view);
+            u64::from(generation) << 32 | u64::from(i)
+        };
+        let set = |index: u32, key: u64| heap.made.set(index, key);
+        let made = |index: u32| heap.made.get(index).unwrap_or(0);
+        // Addresses no test and no title uses.
+        let (at, elsewhere) = (0x7fec_0000_0000u64, 0x7fec_0100_0000u64);
+        // Slot 1 shows the texture's small mips while its view with all of
+        // them waits (`mirror` kept the old one).
+        let (small, all, other) = (key(view(at, 4)), key(view(at, 0)), key(view(elsewhere, 0)));
+        set(1, small);
+        assert_eq!(heap.texture_slot_made_of(1, &view(at, 0)), Some(small));
+        assert_eq!(heap.texture_slot_made_of(1, &view(elsewhere, 0)), None);
+        assert_eq!(heap.texture_slot_made_of(2, &view(at, 0)), None, "made from nothing");
+        // A draw makes slot 1 from another texture after the pass read it.
+        set(1, other);
+        assert!(!heap.texture_slot_gone(1, small));
+        assert_eq!(made(1), other);
+        // Still made from what the pass asked about: let go, once its memory
+        // has been away for the wait (`texture_slot_gone` waits
+        // `VICTORY_TEXTURE_AWAY_MS`, 3000 ms by default, for a title that
+        // unmaps a texture before it maps it again).
+        set(1, all);
+        let wait: u64 = std::env::var("VICTORY_TEXTURE_AWAY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3000);
+        if wait > 0 {
+            assert!(!heap.texture_slot_gone(1, all), "the first look at it away waits");
+        }
+        let began = crate::host::now_ms();
+        loop {
+            if heap.texture_slot_gone(1, all) {
+                break;
+            }
+            assert!(crate::host::now_ms().saturating_sub(began) < wait + 2000, "not let go after the wait");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(made(1), 0);
+        assert!(!heap.texture_slot_gone(1, 0));
+    }
+
     /// A null 3D UAV made on the real device leaves it alive.
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
@@ -5638,37 +5731,37 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100, true).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
+        assert_eq!(q.due(9, 2, true).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100, true).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100, true).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert_eq!(q.due(frame, 100, true)[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100, true).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert_eq!(q.due(12, 100, true)[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100)[0].0, 16);
+        assert_eq!(q.due(13, 100, true)[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -5676,11 +5769,58 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100, true).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100, true).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100, true).iter().any(|d| d.0 == 98));
+    }
+
+    /// Slots looked at before do not crowd out the first look at the
+    /// others while the card has room: with more of them due than a pass
+    /// is handed (13,000-14,800 due in one run, some for over 950 frames),
+    /// and with a pass that stops early on its time or bytes,
+    /// never-looked-at slots still come near the front, newest and oldest
+    /// in turns. With the card full they wait behind all of those: the pass
+    /// can make no host texture for them, and stops after 1024 refusals.
+    #[test]
+    fn slots_looked_at_before_leave_room_for_first_looks() {
+        let mut q = TextureQueue::default();
+        // 5000 slots of a scene's start, looked at in frame 1200 with
+        // nothing to upload, and due again from 1201.
+        for index in 0..5000u32 {
+            q.written(index, 1200, 0, false);
+        }
+        let writes: Vec<(u32, u64)> = q.due(1200, usize::MAX, true);
+        for &(index, write) in &writes {
+            q.later(index, write, 1200, 256);
+        }
+        // Three first-time slots, written after the 5000 looked at.
+        for (index, frame) in [(9000, 2150), (9001, 2151), (9002, 2152)] {
+            q.written(index, frame, frame, false);
+        }
+        let first = |i: &u32| *i >= 9000;
+        let order: Vec<u32> = q.due(2152, 4096, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 4096);
+        // A pass that stops after four slots still reaches two first looks.
+        assert_eq!(order[..4].iter().filter(|i| first(i)).count(), 2, "{:?}", &order[..4]);
+        // Still one looked at before first, and newest, oldest, newest after.
+        assert!(!first(&order[0]));
+        let firsts: Vec<u32> = order.iter().copied().filter(first).collect();
+        assert_eq!(firsts, [9002, 9000, 9001]);
+
+        // The card full: the 4096 handed out are all looked at before, in
+        // the order they had with room, and the first looks come only after
+        // the last of them.
+        let full: Vec<u32> = q.due(2152, 4096, false).into_iter().map(|d| d.0).collect();
+        let again: Vec<u32> = order.iter().copied().filter(|i| !first(i)).collect();
+        assert_eq!(full.len(), 4096);
+        assert!(!full.iter().any(first));
+        assert_eq!(full[..again.len()], again[..]);
+        let all: Vec<u32> = q.due(2152, usize::MAX, false).into_iter().map(|d| d.0).collect();
+        assert_eq!(all.len(), 5003);
+        assert!(!all[..5000].iter().any(first));
+        assert_eq!(all[5000..], [9002, 9000, 9001]);
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -5693,25 +5833,25 @@ mod tests {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let due = q.due(1, 100, false);
         assert_eq!(due.len(), 4);
         // The card is full: slots 20 and 21 are held back until frame 101.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
             q.hold(index, write, 101);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 100, false).into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
         assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
         // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.due(101, 100, false), due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 100, false).iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 100, true).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
     }
 
@@ -5840,7 +5980,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fed_0000_0000u64;
         let mut desc = [0u32; 16];
@@ -5850,7 +5990,7 @@ mod tests {
         let written = [(at, at + 0x1000)];
         // Waiting for its first upload: held, not uploaded, nothing done.
         assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -5920,7 +6060,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         // 64x64 BC7, one mip, at an address no test and no title uses.
         let at = 0x7fee_0000_0000u64;
         let view = |address: u64, width: u32| {
@@ -5930,7 +6070,7 @@ mod tests {
         };
         let len = crate::resource::placed_bytes(&[3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0]).unwrap();
         assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
-        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
@@ -6014,7 +6154,7 @@ mod tests {
             return; // no host GPU
         };
         let frame = 100;
-        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8, true).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);
