@@ -81,7 +81,8 @@ ZCAP="Z:${WORK//\//\\}\\capture"
 ZGAME="$GAME"
 ZCACHE="Z:${CACHE//\//\\}"
 
-cat > "$BAT" <<EOF
+{
+    cat <<EOF
 @echo off
 set VICTORY_LOG=$LOG_FILTER
 set VICTORY_KEYS=$KEYS
@@ -89,9 +90,12 @@ set VICTORY_CACHE_DIR=$ZCACHE
 set VICTORY_CAPTURE=$ZCAP
 set VICTORY_CAPTURE_WORLD=0,3
 EOF
-[ "${SWEEP_DEBUG:-0}" = 1 ] && printf 'set VICTORY_D3D12_DEBUG=1\n' >> "$BAT"
-[ -n "${EXTRA_OVERRIDE:-}" ] && printf '%s\n' "$EXTRA_OVERRIDE" >> "$BAT"
-printf '%s\n' "\"$ZEXE\" run \"$ZGAME\" --execute --console $CONSOLE > Z:${WORK//\//\\\\}app.log 2>&1" >> "$BAT"
+    [ "${SWEEP_DEBUG:-0}" = 1 ] && echo 'set VICTORY_D3D12_DEBUG=1'
+    [ -n "${EXTRA_OVERRIDE:-}" ] && echo "$EXTRA_OVERRIDE"
+    cat <<EOF
+"$ZEXE" run "$ZGAME" --execute --console $CONSOLE > Z:${WORK//\//\\}\\app.log 2>&1
+EOF
+} > "$BAT"
 
 # Optional extra VICTORY_* settings for a diagnostic sweep, e.g.
 # SWEEP_EXTRA='set VICTORY_PORT_CONSTANTS=1'. Inserted before the run line.
