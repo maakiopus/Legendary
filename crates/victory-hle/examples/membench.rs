@@ -429,22 +429,31 @@ mod imp {
         check!(hi - lo <= 20, "drift in the second half: {} ticks over {:.1} s", hi - lo, seconds as f64 / 2.0);
         let [_, anchored, step] = [0, 1, 2].map(|i| tscclock::SERVED[i].load(Relaxed));
         println!("       anchored {anchored} times; the largest step an anchoring found: {step} ticks");
-        // Several threads reading at once never see it go backwards either.
+        // Several threads never see it go backwards either: a reading taken
+        // after another thread's was published is not before it. In bursts
+        // over 2.5 s, so that anchorings fall among them.
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 std::thread::spawn(|| {
                     static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let mut backwards = 0u64;
-                    for _ in 0..200_000 {
-                        let now = tscclock::ticks().unwrap_or(0);
-                        backwards += u64::from(now < SEEN.fetch_max(now, Relaxed));
+                    let (mut backwards, mut reads) = (0u64, 0u64);
+                    let until = Instant::now() + Duration::from_millis(2500);
+                    while Instant::now() < until {
+                        for _ in 0..20_000 {
+                            let published = SEEN.load(std::sync::atomic::Ordering::SeqCst);
+                            let now = tscclock::ticks().unwrap_or(0);
+                            backwards += u64::from(now < published);
+                            SEEN.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                            reads += 1;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
                     }
-                    backwards
+                    (backwards, reads)
                 })
             })
             .collect();
-        let backwards: u64 = threads.into_iter().map(|t| t.join().unwrap_or(1)).sum();
-        check!(backwards == 0, "4 threads, 200,000 readings each against one shared latest: {backwards} backwards");
+        let (backwards, reads) = threads.into_iter().map(|t| t.join().unwrap_or((1, 0))).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        check!(backwards == 0, "4 threads, {reads} readings against one shared latest: {backwards} backwards");
     }
 
     pub(super) fn main() {

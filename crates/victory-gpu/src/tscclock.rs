@@ -48,9 +48,17 @@ fn wanted() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_TSC_CLOCK").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// The processor's counter, read once everything before it has run
+/// (`lfence`): read out of order, ahead of a load still waiting for another
+/// core's store, it gave a thread a time before the one that store had
+/// published (membench: 1 reading in 750 against a shared latest).
+#[inline]
 fn tsc() -> u64 {
-    // SAFETY: every x86-64 processor has the instruction.
-    unsafe { core::arch::x86_64::_rdtsc() }
+    // SAFETY: every x86-64 processor has the instructions.
+    unsafe {
+        core::arch::x86_64::_mm_lfence();
+        core::arch::x86_64::_rdtsc()
+    }
 }
 
 /// Whether the counter runs at one rate in every power state and on every
@@ -110,14 +118,22 @@ fn on_line((tsc0, base, rate): (u64, u64, u64), tsc: u64) -> u64 {
     base + ((u128::from(counts) * u128::from(rate)) >> 32) as u64
 }
 
-fn set_line(tsc0: u64, base: u64, rate: u64) {
+/// Puts the clock on a new line from the counter's value now, which `new`
+/// is given, with the ticks there and the rate it returns. Readers wait for
+/// the few instructions between the reading of the counter and the new
+/// line: one that read the old line any later than that could be ahead of
+/// what the next reads from the new (the clock would go backwards between
+/// two threads).
+fn set_line(new: impl FnOnce(u64) -> (u64, u64)) {
     // (One thread only ever writes.)
     let seq = SEQ.load(Ordering::Relaxed);
-    SEQ.store(seq + 1, Ordering::Release);
-    TSC0.store(tsc0, Ordering::Relaxed);
+    SEQ.store(seq + 1, Ordering::SeqCst);
+    let at = tsc();
+    let (base, rate) = new(at);
+    TSC0.store(at, Ordering::Relaxed);
     BASE.store(base, Ordering::Relaxed);
     RATE.store(rate, Ordering::Relaxed);
-    SEQ.store(seq + 2, Ordering::Release);
+    SEQ.store(seq + 2, Ordering::SeqCst);
 }
 
 /// The ticks now, by the processor's counter; `None` before the first
@@ -188,7 +204,8 @@ fn keep(real: Qpc) {
         tracing::warn!("VICTORY_TSC_CLOCK=1 but falling back to the host's QueryPerformanceCounter: the processor's counter does not move with it");
         return;
     };
-    set_line(last.0, last.1, true_rate);
+    // (From the counter now, on the line through the second pair.)
+    set_line(|at| (last.1 + ((u128::from(at.saturating_sub(last.0)) * u128::from(true_rate)) >> 32) as u64, true_rate));
     tracing::info!(
         counts_per_tick = format_args!("{:.3}", (1u64 << 32) as f64 / true_rate as f64),
         "VICTORY_TSC_CLOCK=1: QueryPerformanceCounter answered from rdtsc, anchored to the host's every second"
@@ -221,10 +238,8 @@ fn keep(real: Qpc) {
         let correction = ((i128::from(-step) << 32) / i128::from(now.0 - last.0))
             .clamp(-i128::from(true_rate / 2000), i128::from(true_rate / 2000));
         let rate = (i128::from(true_rate) + correction).max(1) as u64;
-        // (From where the old line is at this very moment: what another
-        // thread reads from the old line just now is not ahead of the new.)
-        let at = tsc();
-        set_line(at, on_line(line, at), rate);
+        // From where the old line is at that moment: no jump.
+        set_line(|at| (on_line(line, at), rate));
         last = now;
     }
 }
