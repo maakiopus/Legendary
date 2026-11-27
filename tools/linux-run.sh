@@ -70,5 +70,36 @@ echo "exe=$EXE" >"$LOG.run"
 echo "game=$GAME console=$CONSOLE proton=$PROTON" >>"$LOG.run"
 echo "log=$LOG" >>"$LOG.run"
 
-exec gamescope -W 1920 -H 1080 -r 75 -f --mangoapp --force-grab-cursor -- \
-    umu-run "$(wine "$EXE")" run "$(wine "$GAME")" --execute --console "$CONSOLE" "$@"
+# Renderer port 1's heap is a userptr under vkd3d-proton, and amdgpu walks
+# every 4 KiB page of it on each submission. Once port 1's private pages are
+# in the log, collapse them into 2 MiB pages every 15 s with the helper
+# (`linux/thp/`); nothing else about the run changes. `VICTORY_THP=0`: not.
+thp() {
+    local helper=$ROOT/linux/thp/victory-thp-collapse
+    [ "${VICTORY_THP:-1}" = 1 ] || return 0
+    [ -x "$helper" ] || return 0
+    while sleep 15; do
+        [ -n "$(pgrep -f 'victory[^ ]*\.exe run' || true)" ] || return 0
+        local pid ranges
+        pid=$(for p in $(pgrep -f 'victory[^ ]*\.exe run' || true); do
+                  echo "$(ls /proc/"$p"/task 2>/dev/null | wc -l) $p"
+              done | sort -rn | awk 'NR==1{print $2}')
+        [ -n "$pid" ] || continue
+        ranges=$(grep -aoE "32-bit heap are private memory.*at=0x[0-9a-f]+ len=[0-9]+" "$LOG" 2>/dev/null \
+            | sed -E 's/.*at=0x([0-9a-f]+) len=([0-9]+)/\1 \2/' | sort -u \
+            | while read -r a l; do printf "%x %x " $((16#$a)) $((16#$a + l)); done)
+        [ -n "$ranges" ] || continue
+        "$helper" "$pid" $ranges >/dev/null 2>&1
+    done
+}
+
+gamescope -W 1920 -H 1080 -r 75 -f --mangoapp --force-grab-cursor -- \
+    umu-run "$(wine "$EXE")" run "$(wine "$GAME")" --execute --console "$CONSOLE" "$@" &
+game=$!
+thp &
+thp_pid=$!
+trap 'kill "$thp_pid" 2>/dev/null' EXIT INT TERM
+wait "$game"
+status=$?
+kill "$thp_pid" 2>/dev/null
+exit "$status"
