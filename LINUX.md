@@ -85,9 +85,11 @@ gives it `cap_sys_nice`, sets the play defaults (warn log, 0.667 render
 scale, joined card rehash, card steps, joined copies, and the memory-path set
 measured on a fixed save: `VICTORY_RELAY_COPY=1`, `VICTORY_COPY_COMPARE=1`,
 `VICTORY_COPY_BESIDE=1`, `VICTORY_STORE_BESIDE=1`,
-`VICTORY_LATE_WAIT_LISTS=1024`, card buffers from a 64 KiB floor to a
-1536 MB total cap), then calls `tools/linux-run.sh`. `VICTORY_INPLACE` stays
-off. `RUN_BUILD_GAME=0` and `RUN_BUILD_WINE=0` turn off the automatic steps.
+`VICTORY_LATE_WAIT_LISTS=1024`, `VICTORY_TEXTURE_NO_WAIT=1`, card buffers
+from a 64 KiB floor to a 1536 MB total cap), then calls
+`tools/linux-run.sh`. `VICTORY_INPLACE` stays off. `RUN_BUILD_GAME=0` and
+`RUN_BUILD_WINE=0` turn off the automatic steps. Measured on `GTA6SAVES`'
+Manual Save: 157.7 ms a frame before, 135.7 ms with the set (660 s, PASS).
 
 The beside switches (`VICTORY_COPY_BESIDE`, `VICTORY_STORE_BESIDE`) write
 the title's copies and stores through our own view of the pages instead of

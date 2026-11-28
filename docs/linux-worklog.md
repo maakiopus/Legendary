@@ -194,12 +194,13 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
   wait 61.9 -> 16.1) -> `+COPY_COMPARE=1` 145.9 (48 of 68 MB written found
   unchanged and not sent) -> `+COPY_BESIDE=1` 143.1 -> `+STORE_BESIDE=1`
   141.4 (guard wait 27.3 -> 11.2 ms) -> `+LATE_WAIT_LISTS=1024` 140.4 ->
-  `+CARD_BUFFERS_MIN_KB=64, _MB=1536` 139.2 (p99 192). 660 s validation of
-  that set: PASS, 140.9 ms, p95 173.9, p99 215.3, 0 spikes, 0 faults,
-  518/525 world captures non-blank. Losing arms: `JOIN_PARTS=8` 156.6,
+  `+CARD_BUFFERS_MIN_KB=64, _MB=1536` 139.2 (p99 192) -> `+TEXTURE_NO_WAIT=1`
+  138.0. 660 s validation of that set: PASS, **135.7 ms**, p95 176.7,
+  p99 207.8, 0 faults, 534/541 world captures non-blank, 0 black frames. Losing arms: `JOIN_PARTS=8` 156.6,
   `LIGHT_REFRESH=0` 195.9, `CARD_BUFFERS_MIN_MB=16` 215.4,
   `WIDE_THREADS=4` 154.2, `THIN=1` 148.2, `VIEW_ASK=1` 144.3;
-  `INDIRECT_BATCH=2` 138.8 failed on one black frame and is excluded.
+  `INDIRECT_BATCH=2` 138.8 failed on one black frame and is excluded;
+  `CARD_STEPS=0/4` 169.3/170.3, `UP_QUEUE=1` and `ASK_EARLY=0` neutral.
   20 fps not reached: what is left is the sync work itself (refresh flush
   46 ms over 6,305 pages, write-watch 44 ms with 428 refused askings,
   copies 42 ms over ~93 MB), all on the submitting thread.

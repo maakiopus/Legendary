@@ -15,11 +15,11 @@
 #
 # Play defaults: warn-level logging, 0.667 render scale, joined card rehash
 # runs, card steps on the card and joined copies, plus the memory-path set
-# measured on a fixed save (157.7 -> 139.2 ms a frame in a 480 s arm, p99
-# 391 -> 192; a 660 s validation of the same set: 140.9 ms, p99 215.3, no
-# spikes, no faults): the relay's fetches on the copy queue, refreshes that
-# skip unchanged bytes, the title's copies and stores written beside the
-# guards, 1024 lists in the air, and card buffers from a 64 KiB floor to a
+# measured on a fixed save (157.7 -> 135.7 ms a frame at 660 s, p99 391 ->
+# 208; a 480 s arm of the same set: 138.0): the relay's fetches on the copy
+# queue, refreshes that skip unchanged bytes, the title's copies and stores
+# written beside the guards, 1024 lists in the air, texture refreshes that do
+# not wait for the remap lock, and card buffers from a 64 KiB floor to a
 # 1536 MB cap. VICTORY_INPLACE is deliberately not set: it regressed in
 # testing. RUN_BUILD_WINE=0 and RUN_BUILD_GAME=0 skip the package and exe
 # builds.
@@ -99,4 +99,5 @@ if [ -z "${VICTORY_CARD_BUFFERS_MIN_MB:-}" ]; then
     export VICTORY_CARD_BUFFERS_MIN_KB=${VICTORY_CARD_BUFFERS_MIN_KB:-64}
 fi
 export VICTORY_CARD_BUFFERS_MB=${VICTORY_CARD_BUFFERS_MB:-1536}
+export VICTORY_TEXTURE_NO_WAIT=${VICTORY_TEXTURE_NO_WAIT:-1}
 exec "$ROOT/tools/linux-run.sh" "$@"
