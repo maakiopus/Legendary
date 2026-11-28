@@ -180,6 +180,12 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read. Not
+    // a placeholder reservation: its protection says nothing of the pages
+    // committed there later (and frees of placeholders are not noted).
+    if !at.is_null() && !placeholder && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
