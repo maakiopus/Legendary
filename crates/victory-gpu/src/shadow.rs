@@ -124,6 +124,16 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
+    /// With [`whole_page`]: the pages of 4 KiB of title memory from the
+    /// copy's `start` on that a shader has written since the page last
+    /// went up whole to the card's side, a bit each: noted when a fetched
+    /// piece of the copy is merged ([`Shadow::card_merge`],
+    /// [`Shadow::card_merge_relay`], [`Shadow::land_card`]), and a page
+    /// with a bit is not widened to the page whole, for the send could put
+    /// title memory over what the shader wrote. Its own lock, and nothing
+    /// is taken behind it ([`Shadow::widened_pages`] holds it with
+    /// `dirty`'s).
+    wrote: Mutex<Vec<u64>>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
@@ -628,6 +638,26 @@ impl SentRuns {
     }
 }
 
+/// Whether the changed ranges of a copy in the card's memory that lie in a
+/// 4 KiB page of title memory no shader wrote since the page last went up
+/// are sent whole (`VICTORY_WHOLE_PAGE=1`; off by default): one copy of
+/// the page instead of one of every changed run in it
+/// ([`card_dirty`], [`Shadow::widened_pages`]).
+///
+/// The refresh finds tens of thousands of ranges of a few hundred bytes
+/// and copies them up one by one (docs/20fps.md, "What would move it",
+/// 1); most of their pages are never written by a shader, and a page
+/// whose card copy has had no shader write since it was last sent can
+/// take the CPU side's bytes whole.
+pub(crate) fn whole_page() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WHOLE_PAGE").is_some_and(|v| v != "0");
+        tracing::info!(on, "whole-page sends of the card's copies' pages no shader wrote (VICTORY_WHOLE_PAGE)");
+        on
+    })
+}
+
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -643,6 +673,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let whole = whole_page();
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
@@ -653,7 +684,14 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
+                let mut ranges = joined(std::mem::take(&mut *dirty));
+                // With [`whole_page`]: the pages no shader wrote since they
+                // last went up go whole. The check takes `dirty`'s lock with
+                // it, so that a merge of a fetched piece is done with its
+                // notes before (or after, whole) this send.
+                if whole {
+                    ranges = shadow.widened_pages(ranges);
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
@@ -777,6 +815,67 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         match out.last_mut() {
             Some(last) if from <= last.1 => last.1 = last.1.max(to),
             _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// [`Shadow::widened_pages`]'s walk over the pages. `ranges` are the changed
+/// ranges of a copy of `len` bytes of title memory from `start` on, in order
+/// and joined; `busy` are the copy's offsets still in the air for shaders,
+/// in order and joined; `wrote` has a bit for each page of 4 KiB a shader
+/// wrote since the page last went up whole. Every changed range is in the
+/// result, each widened to the whole of each page it holds that neither list
+/// names. The pages never reach past the copy's own bytes.
+///
+/// Why the gaps of a widened page may go up: what the CPU wrote to the page
+/// since it last went up is the changed ranges themselves ([`card_changed`]
+/// notes every one); what a shader wrote lies on the card only while its
+/// flight is in the air (`busy`, which no widened page holds) or was
+/// fetched and merged already, which noted the page in `wrote`; and the
+/// bytes left are the same on the CPU's side and the card's, for those two
+/// things and the changed ranges are all the sides differ by. A byte of a
+/// gap is therefore one only the CPU wrote since the last send, or one
+/// already identical on both sides: the copy of the page puts nothing over
+/// it that the card held alone.
+fn widen_pages(
+    start: usize,
+    len: usize,
+    ranges: Vec<(usize, usize)>,
+    busy: &[(usize, usize)],
+    wrote: &[u64],
+) -> Vec<(usize, usize)> {
+    let (first, skew) = (start / KERNEL_PAGE, start % KERNEL_PAGE);
+    // The offsets in the copy of page `page` (`0`: the one `start` lies in),
+    // cut to the copy's own bytes.
+    let bounds = |page: usize| {
+        let lo = ((page * KERNEL_PAGE) as i64 - skew as i64).max(0) as usize;
+        (lo, ((page + 1) * KERNEL_PAGE - skew).min(len))
+    };
+    let bit = |wrote: &[u64], page: usize| wrote.get(page / 64).is_some_and(|w| w >> (page % 64) & 1 != 0);
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    let push = |out: &mut Vec<(usize, usize)>, from: usize, to: usize| match out.last_mut() {
+        Some(last) if from <= last.1 => last.1 = last.1.max(to),
+        _ => out.push((from, to)),
+    };
+    for &(from, to) in &ranges {
+        let to = to.min(len);
+        let mut at = from;
+        while at < to {
+            let page = (start + at) / KERNEL_PAGE - first;
+            let (lo, hi) = bounds(page);
+            let next = hi.min(to);
+            let air = busy.partition_point(|&b| b.1 <= lo);
+            // A page a flight may be at keeps the range as it is; so does
+            // one a fetched piece of was merged since it last went up (its
+            // bit of `wrote` stays, and the page is not widened again:
+            // conservative, and the pages with one are not what this saves).
+            if busy.get(air).is_none_or(|&b| b.0 >= hi) && !bit(wrote, page) {
+                push(&mut out, lo, hi);
+            } else {
+                push(&mut out, at, next);
+            }
+            at = next.max(at + 1);
         }
     }
     out
@@ -924,6 +1023,84 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod widen_tests {
+    use super::{KERNEL_PAGE, widen_pages};
+
+    /// The bit of `wrote` for a page, as [`super::note_wrote`] sets it.
+    fn bit(mut wrote: Vec<u64>, page: usize) -> Vec<u64> {
+        if wrote.len() <= page / 64 {
+            wrote.resize(page / 64 + 1, 0);
+        }
+        wrote[page / 64] |= 1 << (page % 64);
+        wrote
+    }
+
+    /// Ranges that lie in one clean page go up as the page whole.
+    #[test]
+    fn ranges_in_one_clean_page_go_as_the_page() {
+        let page = KERNEL_PAGE;
+        let wrote = Vec::new();
+        assert_eq!(widen_pages(0, 16 * page, vec![(10, 20), (30, 40)], &[], &wrote), [(0, page)]);
+        // (And the copy is empty when nothing changed.)
+        assert_eq!(widen_pages(0, 16 * page, vec![], &[], &wrote), []);
+    }
+
+    /// A page whose piece the compare flagged, fetched and merged, is not
+    /// widened: its ranges go as they are.
+    #[test]
+    fn a_page_a_piece_was_fetched_of_is_not_widened() {
+        let page = KERNEL_PAGE;
+        let wrote = bit(Vec::new(), 1);
+        assert_eq!(widen_pages(0, 16 * page, vec![(page + 10, page + 20)], &[], &wrote), [(page + 10, page + 20)]);
+        // (Another page of the same copy is widened still.)
+        assert_eq!(
+            widen_pages(0, 16 * page, vec![(2 * page + 10, 2 * page + 20)], &[], &wrote),
+            [(2 * page, 3 * page)]
+        );
+    }
+
+    /// A range over a page line takes the clean page whole and the page a
+    /// shader wrote only as much of it as changed (the two touch at the
+    /// page line, so they join in the result).
+    #[test]
+    fn a_range_over_a_page_line_is_split() {
+        let page = KERNEL_PAGE;
+        let wrote = bit(Vec::new(), 1);
+        assert_eq!(widen_pages(0, 16 * page, vec![(page - 100, page + 100)], &[], &[]), [(0, 2 * page)]);
+        assert_eq!(
+            widen_pages(0, 16 * page, vec![(page - 100, page + 100)], &[], &wrote),
+            [(0, page + 100)]
+        );
+    }
+
+    /// A page a flight may still be writing is not widened.
+    #[test]
+    fn a_page_in_the_air_for_shaders_is_not_widened() {
+        let page = KERNEL_PAGE;
+        assert_eq!(
+            widen_pages(0, 16 * page, vec![(page + 10, page + 20)], &[(page + 5, page + 25)], &[]),
+            [(page + 10, page + 20)]
+        );
+        // A flight beside the page does not keep the page narrow.
+        assert_eq!(widen_pages(0, 16 * page, vec![(page + 10, page + 20)], &[(2 * page, 2 * page)], &[]), [
+            (page, 2 * page)
+        ]);
+    }
+
+    /// A widened page holds the copy's own bytes only: the first page of a
+    /// copy that starts inside a page of title memory, and the last one,
+    /// are cut to the copy's length.
+    #[test]
+    fn pages_are_cut_to_the_copy() {
+        let page = KERNEL_PAGE;
+        // `start` 100: the first page is its last 3,996 bytes.
+        assert_eq!(widen_pages(100, 15 * page, vec![(10, 20)], &[], &[]), [(0, page - 100)]);
+        // And the copy ends 50 bytes into a page.
+        assert_eq!(widen_pages(0, page + 50, vec![(page, page + 50)], &[], &[]), [(page, page + 50)]);
     }
 }
 
@@ -4472,6 +4649,65 @@ impl Shadow {
         self.card_changed_runs(std::iter::once((from, to)));
     }
 
+    /// [`whole_page`]: the copy's changed ranges `ranges` (in order and
+    /// joined, at their offsets) widened to the 4 KiB pages of title memory
+    /// that hold them, where nothing says a shader wrote the page since it
+    /// last went up: a page a flight may still be at ([`Shadow::pending`])
+    /// or that a fetched piece of was merged into ([`Card::wrote`], which
+    /// keeps its bit: conservative, and a page with one is not what this
+    /// saves) keeps its ranges as they are. Copies whose stores by address
+    /// are kept (`Shadow::changes_only`, the arenas) are not widened at
+    /// all: their gap bytes may hold what a shader stored undeclared,
+    /// which only the title's changed dwords must not go over.
+    ///
+    /// Called with `dirty`'s lock, under which the walk takes `wrote`'s.
+    fn widened_pages(&self, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let Some(card) = &self.card else {
+            return ranges;
+        };
+        if self.changes_only.load(Ordering::Relaxed) || ranges.is_empty() {
+            return ranges;
+        }
+        let (start, len) = (self.start as usize, self.len as usize);
+        // The ranges of flights in the air, cut to the copy: no widened page
+        // may hold one, for its send could put title memory over what the
+        // flight's shaders write (and over what the merge of a fetched
+        // piece still to come would put into the CPU's side).
+        let busy: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let in_copy =
+                |&(a, e): &(usize, usize)| (a.max(start).saturating_sub(start), e.min(start + len).saturating_sub(start));
+            joined(pending.iter().map(in_copy).filter(|&(a, e)| a < e).collect())
+        };
+        let wrote = card.wrote.lock().unwrap_or_else(|e| e.into_inner());
+        widen_pages(start, len, ranges, &busy, &wrote)
+    }
+
+    /// [`whole_page`]: what is fetched of a piece was merged into the copy's
+    /// bytes at offsets `[from, to)`, which may hold what a shader wrote:
+    /// its pages are noted in [`Card::wrote`], and from here on they are
+    /// not widened ([`whole_page`]). Off the switch this says nothing, for
+    /// nothing is widened.
+    fn note_wrote(&self, from: usize, to: usize) {
+        if !whole_page() || from >= to {
+            return;
+        }
+        let Some(card) = &self.card else {
+            return;
+        };
+        let start = self.start as usize;
+        let first = start / KERNEL_PAGE;
+        let page = |at: usize| (start + at) / KERNEL_PAGE - first;
+        let (first_page, last_page) = (page(from), page(to.saturating_sub(1)));
+        let mut wrote = card.wrote.lock().unwrap_or_else(|e| e.into_inner());
+        if wrote.len() <= last_page / 64 {
+            wrote.resize(last_page / 64 + 1, 0);
+        }
+        for p in first_page..=last_page {
+            wrote[p / 64] |= 1 << (p % 64);
+        }
+    }
+
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
@@ -4670,6 +4906,9 @@ impl Shadow {
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
         }
+        // The piece was fetched: its pages may hold what a shader wrote
+        // ([`whole_page`] does not widen them again).
+        self.note_wrote(at, at + gpu.len());
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
@@ -4735,6 +4974,9 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        // The piece was fetched: its pages may hold what a shader wrote
+        // ([`whole_page`] does not widen them again).
+        self.note_wrote(at, at + gpu.len());
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
@@ -4787,6 +5029,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                wrote: Mutex::default(),
                 touched: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
@@ -4854,6 +5097,9 @@ impl Shadow {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
+            // The piece was fetched: its pages may hold what a shader wrote
+            // ([`whole_page`] does not widen them again).
+            self.note_wrote(lo, hi);
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
             // SAFETY: inside the mapping (checked above), in a range
@@ -4943,6 +5189,7 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            wrote: Mutex::default(),
                 touched: Default::default(),
             size: len as u64,
         });
@@ -5364,6 +5611,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    wrote: Mutex::default(),
                 touched: Default::default(),
                     size,
                 };
@@ -5601,6 +5849,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
+        wrote: Mutex::default(),
         touched: Default::default(),
         size: len,
     });
@@ -5690,6 +5939,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                wrote: Mutex::default(),
                 touched: Default::default(),
                 size: len,
             };
