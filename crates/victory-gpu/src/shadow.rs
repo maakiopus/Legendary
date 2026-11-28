@@ -2094,6 +2094,7 @@ fn wide_differing(from: &[u8], to: &[u8]) -> bool {
 /// the slices' own compare of what is left. The words are gathered byte by
 /// byte, so unaligned slices are none of it.
 fn differing_words(from: &[u8], to: &[u8]) -> bool {
+    debug_assert_eq!(from.len(), to.len());
     let n = from.len();
     let mut i = 0;
     while i + 8 <= n {
