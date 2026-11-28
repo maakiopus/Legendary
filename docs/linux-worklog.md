@@ -204,3 +204,17 @@ Layer builds: `cargo xwin`, `x86_64-pc-windows-msvc`, `diag` profile unless said
   20 fps not reached: what is left is the sync work itself (refresh flush
   46 ms over 6,305 pages, write-watch 44 ms with 428 refused askings,
   copies 42 ms over ~93 MB), all on the submitting thread.
+- 29 Nov: `VICTORY_WC_NO_BACK` ported from scarlet-fps and merged (`24664d0`):
+  shader-written write-combined copies stay on the card instead of being
+  fetched back. A/B/A on the fixed save: controls 171.4 / 170.6 ms (0.8 ms
+  apart), ported 166.0, p95 170.0 vs 172.9 / 203.8, PASS; the arm left
+  1,982 MB declared WC on the card and the confirmation run shows 7,942.9 MB
+  over its windows. Smaller than Scarlet's win because our card-fetch path
+  was already ~0 ms; the rest of our copy-back is PC-side copies.
+- Reference comparison, same save and console: Scarlet-FPS (Y kekai 3070 base +
+  VIctory-NVIDIA lighting) runs 13.3 fps / 75.0 ms on this card against our
+  135.7 ms; its copies are 18.5 MB vs our 92 MB and copy-back 0.1 MB vs 15 MB.
+  Profiling both shows the same CPU use (6.9 vs 6.4 cores): the difference is
+  overlap and copied volume, not less work. Ports from it in flight:
+  `SOFT_VIEWS` (texture-refresh asking 19.6 ms vs its 2.8), `GPU_BACK_MAX_KB`,
+  `HEAP_SYNC_AT_SUBMIT`, `TEXBACK_ASYNC`.
