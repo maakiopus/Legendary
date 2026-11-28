@@ -4666,14 +4666,18 @@ impl Shadow {
     /// over. What is left is the known blind spot ([`send_changed`]'s too):
     /// a store through a view nobody declares, on a copy neither of those
     /// watches, may be put over page-wide, where the narrow send puts over
-    /// the changed dwords only.
+    /// the changed dwords only. So a store that a copy picked does not
+    /// watch yet holds (one shown through a table slot whose views are
+    /// left out for a while, `crate::draw`'s `copied_tabled`) may be put
+    /// over before its copy is registered: found again the next time its
+    /// shader writes it, as picked's doc says of what is found late.
     ///
     /// Called with `dirty`'s lock, under which the walk takes `wrote`'s.
     fn widened_pages(&self, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         let Some(card) = &self.card else {
             return ranges;
         };
-        if self.changes_only.load(Ordering::Relaxed) || crate::picked::looks_at(self) || ranges.is_empty() {
+        if ranges.is_empty() || self.changes_only.load(Ordering::Relaxed) || crate::picked::looks_at(self) {
             return ranges;
         }
         let (start, len) = (self.start as usize, self.len as usize);
