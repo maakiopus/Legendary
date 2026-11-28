@@ -17,8 +17,9 @@
 //!   lock over a read of `/proc/self/pagemap`.
 //! - `VICTORY_NATIVE_THREAD_TIMES`: the meters' thread processor time by
 //!   `getrusage(RUSAGE_THREAD)` ([`thread_times`]), where `GetThreadTimes` is
-//!   a wineserver request and a read of `/proc`. Unset: on whenever the
-//!   library is loaded for another switch; `1` loads it for this; `0` off.
+//!   a wineserver request and a read of `/proc`. `1` loads the library for
+//!   this and opts in; unset or `0` keeps `GetThreadTimes` even when another
+//!   switch loads the library.
 //! - (Not wired in this tree: the calls are here, the guards in `watch` do
 //!   not use them.) `VICTORY_NATIVE_PROTECT=1` (LINUXMEM.md S2a): the guards on told views
 //!   by `mprotect` ([`protect`]), merged over views, where `VirtualProtect`
@@ -27,7 +28,7 @@
 //!   userfaultfd in async write-protect mode ([`uffd_watch`], [`dirty`]):
 //!   no change of protection, no signal.
 //!
-//! All off by default but the thread times. Each falls back to the Windows call when we are not
+//! All off by default. Each falls back to the Windows call when we are not
 //! under Wine, the library is not there or its probe says the kernel cannot;
 //! one log line each says which way is taken.
 
@@ -250,10 +251,15 @@ fn asked(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v.trim() == "1")
 }
 
+/// Native thread times require an explicit opt-in and a working library.
+fn native_times_policy(explicit: bool, library_ok: bool) -> bool {
+    explicit && library_ok
+}
+
 fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| {
-        let mut wanted = [
+        let wanted = [
             "VICTORY_DIRECT_PAGES",
             "VICTORY_NATIVE_SCAN",
             "VICTORY_NATIVE_PRESENT",
@@ -264,8 +270,9 @@ fn state() -> &'static State {
         .map(asked);
         // (Not loaded at all with every switch off.)
         let library = if wanted.contains(&true) { load() } else { Err("not asked for".into()) };
-        // The meters' clock: with the library whenever it is there, unless told not to.
-        wanted[5] |= library.is_ok() && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err();
+        // Native thread times are opt-in: the unix-call dispatch is paid on
+        // every diagnostics meter read and costs more than GetThreadTimes in
+        // the fixed-save game workload.
         let caps = library.as_ref().map(|l| l.caps).unwrap_or_default();
         // (VICTORY_NATIVE_SCAN: PAGEMAP_SCAN alone is not enough; the probe
         // asks a write-watched allocation of ours whether Wine's watches are
@@ -321,16 +328,6 @@ fn state() -> &'static State {
             if i == 1 && scan_probe == Some(false) {
                 continue;
             }
-            // (Thread times default on with the library; the env may be unset.
-            // Say which way, not "=1", when the env did not ask.)
-            if i == 5 && std::env::var("VICTORY_NATIVE_THREAD_TIMES").is_err() {
-                if can[5] {
-                    tracing::info!("{name}: on because victory_mem.so is loaded: {native}");
-                } else {
-                    tracing::info!("{name}: off: the library is not loaded or its times call failed: {win32}");
-                }
-                continue;
-            }
             match (wanted[i], can[i], &library) {
                 (false, ..) => tracing::info!("{name}: off (unset): {win32}"),
                 (true, true, _) => tracing::info!("{name}=1: {native} (victory_mem.so)"),
@@ -344,7 +341,7 @@ fn state() -> &'static State {
             native_present: wanted[2] && can[2],
             native_protect: wanted[3] && can[3],
             guard_uffd: wanted[4] && can[4],
-            native_times: wanted[5] && can[5],
+            native_times: native_times_policy(wanted[5], can[5]),
             library: library.ok(),
         }
     })
@@ -734,5 +731,17 @@ pub mod raw {
     pub fn readable(base: usize, len: usize, all: bool) -> Option<(usize, usize)> {
         let mut args = Readable { base, len, all: usize::from(all), there: 0, of: 0 };
         library()?.call(3, &mut args).then_some((args.there, args.of))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_times_policy;
+
+    #[test]
+    fn native_thread_times_are_opt_in() {
+        assert!(!native_times_policy(false, true), "a loaded library is not an opt-in");
+        assert!(!native_times_policy(true, false), "the library must work");
+        assert!(native_times_policy(true, true));
     }
 }
