@@ -125,8 +125,9 @@ struct Card {
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
     /// With [`whole_page`]: the pages of 4 KiB of title memory from the
-    /// copy's `start` on that a shader has written since the page last
-    /// went up whole to the card's side, a bit each: noted when a fetched
+    /// copy's `start` on that a fetched piece of was merged into since the
+    /// page last went up whole to the card's side, a bit each — the bytes
+    /// fetched of it may hold what a shader wrote: noted when a fetched
     /// piece of the copy is merged ([`Shadow::card_merge`],
     /// [`Shadow::card_merge_relay`], [`Shadow::land_card`]), and a page
     /// with a bit is not widened to the page whole, for the send could put
@@ -640,7 +641,8 @@ impl SentRuns {
 
 /// Whether the changed ranges of a copy in the card's memory that lie in a
 /// 4 KiB page of title memory no shader wrote since the page last went up
-/// are sent whole (`VICTORY_WHOLE_PAGE=1`; off by default): one copy of
+/// are sent whole (`VICTORY_WHOLE_PAGE=1`; off by default; on when the
+/// variable is set and is not `0`): one copy of
 /// the page instead of one of every changed run in it
 /// ([`card_dirty`], [`Shadow::widened_pages`]).
 ///
@@ -4656,16 +4658,22 @@ impl Shadow {
     /// or that a fetched piece of was merged into ([`Card::wrote`], which
     /// keeps its bit: conservative, and a page with one is not what this
     /// saves) keeps its ranges as they are. Copies whose stores by address
-    /// are kept (`Shadow::changes_only`, the arenas) are not widened at
-    /// all: their gap bytes may hold what a shader stored undeclared,
-    /// which only the title's changed dwords must not go over.
+    /// are kept (`Shadow::changes_only`, the arenas), and copies the heap
+    /// shows unordered views of (`crate::picked::looks_at`, where a store
+    /// through one is declared by nobody and `crate::picked` is to find
+    /// it), are not widened at all: their gap bytes may hold what a shader
+    /// stored undeclared, which only the title's changed dwords must not go
+    /// over. What is left is the known blind spot ([`send_changed`]'s too):
+    /// a store through a view nobody declares, on a copy neither of those
+    /// watches, may be put over page-wide, where the narrow send puts over
+    /// the changed dwords only.
     ///
     /// Called with `dirty`'s lock, under which the walk takes `wrote`'s.
     fn widened_pages(&self, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         let Some(card) = &self.card else {
             return ranges;
         };
-        if self.changes_only.load(Ordering::Relaxed) || ranges.is_empty() {
+        if self.changes_only.load(Ordering::Relaxed) || crate::picked::looks_at(self) || ranges.is_empty() {
             return ranges;
         }
         let (start, len) = (self.start as usize, self.len as usize);
@@ -5190,7 +5198,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
             wrote: Mutex::default(),
-                touched: Default::default(),
+            touched: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5612,7 +5620,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     wrote: Mutex::default(),
-                touched: Default::default(),
+                    touched: Default::default(),
                     size,
                 };
                 (on_card, Some(card))

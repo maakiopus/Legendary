@@ -256,6 +256,20 @@ pub(crate) fn shown(views: Vec<(Arc<Shadow>, u64, u64)>, all: bool) {
 /// A range of a copy: title address and bytes.
 pub(crate) type Range = (Arc<Shadow>, usize, usize);
 
+/// Whether [`crate::shadow::whole_page`] does not widen a copy's changed
+/// ranges to whole pages: the heap shows unordered views of it
+/// ([`shown`]), and what a shader stores through one is declared by
+/// nobody — a page sent whole could put title memory over the store
+/// before the compare's turn ([`State::turn`]) finds it and the copy is
+/// declared ([`found`]).
+pub(crate) fn looks_at(copy: &Shadow) -> bool {
+    if !on() {
+        return false;
+    }
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.as_ref().is_some_and(|s| s.shown.contains_key(&copy.id()))
+}
+
 /// What is done with a submission.
 #[derive(Default)]
 pub(crate) struct Ranges {
