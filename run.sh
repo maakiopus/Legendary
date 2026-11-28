@@ -16,7 +16,8 @@
 # Play defaults: warn-level logging, 0.667 render scale, joined card rehash
 # runs, card steps on the card and joined copies, plus the memory-path set
 # measured on a fixed save (157.7 -> 135.7 ms a frame at 660 s, p99 391 ->
-# 208; a 480 s arm of the same set: 138.0): the relay's fetches on the copy
+# 208; a 480 s arm of the same set: 138.0; WC_NO_BACK a further 4.6 ms in a
+# 300 s A/B/A, controls 0.8 ms apart): the relay's fetches on the copy
 # queue, refreshes that skip unchanged bytes, the title's copies and stores
 # written beside the guards, 1024 lists in the air, texture refreshes that do
 # not wait for the remap lock, and card buffers from a 64 KiB floor to a
@@ -100,4 +101,6 @@ if [ -z "${VICTORY_CARD_BUFFERS_MIN_MB:-}" ]; then
 fi
 export VICTORY_CARD_BUFFERS_MB=${VICTORY_CARD_BUFFERS_MB:-1536}
 export VICTORY_TEXTURE_NO_WAIT=${VICTORY_TEXTURE_NO_WAIT:-1}
+export VICTORY_WC_NO_BACK=${VICTORY_WC_NO_BACK:-1}
+export VICTORY_WC_NO_BACK_MIN_KB=${VICTORY_WC_NO_BACK_MIN_KB:-1024}
 exec "$ROOT/tools/linux-run.sh" "$@"
