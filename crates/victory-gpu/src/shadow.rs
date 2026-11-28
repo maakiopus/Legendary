@@ -43,6 +43,18 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// [`refresh_skip`], read once, so that a copy of a test's own can have
+    /// another.
+    skip: AtomicU8,
+    /// A change of what title memory shows (`crate::watch::changes`) last
+    /// seen with [`refresh_skip`] on.
+    remapped: AtomicU64,
+    /// Per page of title memory from `start`'s on, for [`refresh_skip`]:
+    /// how many refreshes in a row found the page written but unchanged,
+    /// and how many in a row it was passed over unread on that account.
+    /// Taken under `copied`'s lock ([`Shadow::copy_stale`]) or alone
+    /// ([`Shadow::take`]).
+    unchanged: Mutex<Vec<(u8, u8)>>,
     /// Two ranges of title memory taken whole, the last one and the longest,
     /// and the asking after which each was ([`Shadow::copy_stale`]). A page
     /// a range holds in part cannot say so in `copied`. Locked inside
@@ -2874,6 +2886,167 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod skip_tests {
+    use super::{Arc, Ordering, PAGE, Shadow, SKIPPED};
+
+    /// The tests share [`SKIPPED`] (whole process) and take turns; each sets
+    /// its own copy's [`refresh_skip`] (which is read once from the
+    /// environment).
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A copy of `pages` pages of title memory, all of it and the copy
+    /// holding `byte`, with `skip` rounds of passing over, whose pages the
+    /// copy held before ([`send_changed`], as [`keep_stores`] does).
+    /// Returns the copy, the title memory and the copy's side (alive while
+    /// the bindings are), where the title memory starts, and the number of
+    /// its first page.
+    fn made(pages: usize, byte: u8, skip: u8) -> (Arc<Shadow>, Vec<u8>, Vec<u8>, usize, usize) {
+        let room = vec![byte; pages * PAGE + PAGE];
+        let at = (room.as_ptr() as usize).next_multiple_of(PAGE);
+        let side = vec![byte; pages * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_ptr() as *mut u8, (pages * PAGE) as u64, true);
+        copy.changes_only.store(true, Ordering::Relaxed);
+        copy.skip.store(skip, Ordering::Relaxed);
+        (copy, room, side, at, at / PAGE)
+    }
+
+    /// One refresh of `page`, which the title wrote at asking `now`.
+    fn round(copy: &Shadow, at: usize, page: usize, first: usize, now: u64) {
+        copy.copy_stale(at + page * PAGE, at + (page + 1) * PAGE, now, &[(first + page, now)]);
+    }
+
+    /// The first byte of the title's `page` changed to `byte` (a volatile
+    /// write, so that nothing reads it away).
+    fn poke(at: usize, page: usize, byte: u8) {
+        // SAFETY: the title memory of `made`, alive while its copy is.
+        unsafe { ((at + page * PAGE) as *mut u8).write_volatile(byte) };
+    }
+
+    /// [`SKIPPED`] taken, as the frame-rate line takes it.
+    fn skipped() -> [u64; 3] {
+        [0, 1, 2].map(|i| SKIPPED[i].swap(0, Ordering::Relaxed))
+    }
+
+    /// After two rounds that found the written page unchanged, one is
+    /// passed over unread; the next one compares, finds the title's bytes
+    /// changed, and the counts are forgotten, so that two more rounds are
+    /// wanted before a page is passed over again.
+    #[test]
+    fn a_changed_compare_forgets_the_unchanged_counts() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let (copy, room, side, at, first) = made(1, 7, 1);
+        let page = 0;
+        round(&copy, at, page, first, 1); // taken; never taken before
+        assert_eq!(copy.take_dirty(), [(0, PAGE)], "taken whole the first time");
+        round(&copy, at, page, first, 2); // written again, unchanged
+        round(&copy, at, page, first, 3); // written again, unchanged
+        poke(at, page, 6); // the title writes something else
+        round(&copy, at, page, first, 4);
+        let [passed, ..] = skipped();
+        assert_eq!(passed, 1, "the round was passed over");
+        assert_eq!(copy.take_dirty(), [], "nothing was read, so nothing went up");
+        assert_eq!(side[0], 7, "the copy holds the older bytes");
+        round(&copy, at, page, first, 5); // the round after the last passed-over one: compared
+        let [_, changed, ..] = skipped();
+        assert_eq!(changed, 1, "the compare after the passed-over rounds found the change");
+        assert_eq!(copy.take_dirty(), [(0, 4)]);
+        assert_eq!(side[0], 6);
+        // The counts are forgotten: two compares are wanted again.
+        round(&copy, at, page, first, 6); // written, unchanged: the first count
+        round(&copy, at, page, first, 7); // written, unchanged: the second count
+        let [passed, changed, ..] = skipped();
+        assert_eq!((passed, changed), (0, 0), "nothing was passed over while the counts grew again");
+        poke(at, page, 5);
+        round(&copy, at, page, first, 8);
+        let [passed, ..] = skipped();
+        assert_eq!(passed, 1, "the second count in a row let the page be passed over again");
+        assert_eq!(copy.take_dirty(), []);
+        assert_eq!(side[0], 6, "the title's newer bytes are not in yet");
+        round(&copy, at, page, first, 9); // the round after the passed-over one
+        let [_, changed, ..] = skipped();
+        assert_eq!(changed, 1, "the compare after it found the change");
+        assert_eq!(copy.take_dirty(), [(0, 4)]);
+        assert_eq!(side[0], 5);
+        drop(room);
+    }
+
+    /// With `VICTORY_REFRESH_SKIP=2`, two rounds in a row are passed over
+    /// and the third compares; with 1, every other round does.
+    #[test]
+    fn passing_over_stops_after_n_rounds() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        for skip in [2u8, 1] {
+            let (copy, room, side, at, first) = made(1, 7, skip);
+            let page = 0;
+            round(&copy, at, page, first, 1);
+            assert_eq!(copy.take_dirty(), [(0, PAGE)], "taken whole the first time");
+            round(&copy, at, page, first, 2);
+            round(&copy, at, page, first, 3); // two counts in a row
+            assert_eq!(skipped()[0], 0);
+            // `skip` rounds passed over (4..), then the one that compares.
+            let last = 4 + u64::from(skip);
+            for now in 4..=last {
+                poke(at, page, u8::try_from(8 + now).unwrap());
+                round(&copy, at, page, first, now);
+            }
+            let [passed, changed, ..] = skipped();
+            assert_eq!(passed, u64::from(skip), "{skip} rounds were passed over in a row");
+            assert_eq!(changed, 1, "the compare after them found the change");
+            assert_eq!(side[0], u8::try_from(8 + last).unwrap(), "the compare took the title's bytes");
+            drop(room);
+        }
+    }
+
+    /// A page shaders may write or fetch ([`Shadow::writing`]) is compared
+    /// again at once, whatever its counts said.
+    #[test]
+    fn a_page_shaders_take_is_never_passed_over() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let (copy, room, side, at, first) = made(1, 7, 3);
+        let page = 0;
+        round(&copy, at, page, first, 1);
+        assert_eq!(copy.take_dirty(), [(0, PAGE)], "taken whole the first time");
+        round(&copy, at, page, first, 2);
+        round(&copy, at, page, first, 3); // two counts in a row, three rounds to spend
+        copy.writing(at + page * PAGE, PAGE);
+        poke(at, page, 4);
+        round(&copy, at, page, first, 4);
+        let [passed, ..] = skipped();
+        assert_eq!(passed, 0, "the page was compared, not passed over");
+        assert_eq!(copy.take_dirty(), [(0, 4)]);
+        assert_eq!(side[0], 4);
+        drop(room);
+    }
+
+    /// With [`refresh_skip`] at 0 a page written every round is copied every
+    /// round, whatever its counts are, and nothing is ever passed over.
+    #[test]
+    fn with_the_switch_off_nothing_is_passed_over() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let (copy, room, side, at, first) = made(1, 7, 0);
+        let page = 0;
+        round(&copy, at, page, first, 1);
+        assert_eq!(copy.take_dirty(), [(0, PAGE)], "taken whole the first time");
+        round(&copy, at, page, first, 2); // written, unchanged
+        round(&copy, at, page, first, 3); // written, unchanged again
+        poke(at, page, 6);
+        round(&copy, at, page, first, 4);
+        assert_eq!(skipped(), [0; 3], "nothing was passed over or counted as such");
+        assert_eq!(copy.take_dirty(), [(0, 4)], "the changed page was copied as ever");
+        assert_eq!(side[0], 6);
+        round(&copy, at, page, first, 5); // written, unchanged
+        round(&copy, at, page, first, 6); // written, unchanged again
+        poke(at, page, 5);
+        round(&copy, at, page, first, 7); // the counts would let it be passed over
+        let [passed, ..] = skipped();
+        assert_eq!(passed, 0, "the switch at 0 never passes a page over");
+        assert_eq!(copy.take_dirty(), [(0, 4)]);
+        assert_eq!(side[0], 5);
+        drop(room);
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3231,6 +3404,9 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            skip: AtomicU8::new(refresh_skip()),
+            remapped: AtomicU64::new(0),
+            unchanged: Mutex::new(vec![(0u8, 0u8); pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3259,6 +3435,35 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
         (from - start, (address + len).clamp(from, end) - start)
+    }
+
+    /// [`refresh_skip`]'s counts of the pages that `[address, address + len)`
+    /// of title memory (whole or in part) holds are forgotten: something may
+    /// have changed their bytes another way than a refresh's compare found.
+    fn forget(&self, address: usize, len: usize) {
+        if self.skip.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let (from, to) = self.inside(address, len);
+        if from < to {
+            let base = self.start as usize / PAGE;
+            self.forget_each(from / PAGE + base..=(to - 1) / PAGE + base);
+        }
+    }
+
+    /// [`Shadow::forget_each`] of each of `pages` (page numbers of title
+    /// memory), under one taking of the lock.
+    fn forget_each(&self, pages: impl Iterator<Item = usize>) {
+        if self.skip.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        let mut unchanged = self.unchanged.lock().unwrap_or_else(|e| e.into_inner());
+        for page in pages {
+            if let Some(state) = page.checked_sub(base).and_then(|at| unchanged.get_mut(at)) {
+                *state = (0, 0);
+            }
+        }
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -3307,6 +3512,9 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
+        // From here on shaders may write or fetch these pages: whatever a
+        // compare found before says nothing ([`refresh_skip`]).
+        self.forget(address, len);
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -3876,12 +4084,16 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in taken {
+                for &page in &taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
                     }
                 }
             }
+            // The pages were compared against the reference and their
+            // changed bytes put in: whatever a compare of a refresh found
+            // before says nothing ([`refresh_skip`]).
+            self.forget_each(taken.iter().copied());
             under_ns(4, t);
             if over.into_inner() {
                 note_stale(2);
@@ -4167,6 +4379,26 @@ impl Shadow {
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        // [`refresh_skip`], but never under an update-check (which is to see
+        // every byte as it is), and the counts of a change of what title
+        // memory shows forgotten before they are read: the pages may hold
+        // other bytes now, with nothing to tell of it.
+        let skip = if crate::host::upcheck::on() { 0 } else { self.skip.load(Ordering::Relaxed) };
+        if skip > 0 {
+            let changes = crate::watch::changes();
+            if self.remapped.swap(changes, Ordering::Relaxed) != changes {
+                self.unchanged.lock().unwrap_or_else(|e| e.into_inner()).fill((0, 0));
+            }
+        }
+        // Under `copied`'s lock (as `ranged` above is), and not held while
+        // the pages are taken ([`Shadow::take`] takes it alone). None of
+        // this runs with the switch at 0.
+        let mut unchanged = (skip > 0).then(|| self.unchanged.lock().unwrap_or_else(|e| e.into_inner()));
+        // Whether a page was passed over: the range is then not noted taken
+        // whole (`ranged` below), for a page's `copied` says an older
+        // asking than the range's.
+        let mut passed = false;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -4180,8 +4412,28 @@ impl Shadow {
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+                if taken != 0 && whole && skip > 0 {
+                    // A page taken before, written since, whose last two
+                    // compares in a row found nothing to copy, and fewer
+                    // than `skip` rounds of refreshes in a row passed
+                    // over: this one is too, unread. Its `copied` stays as
+                    // it was, so the next round asks after it again, and
+                    // after `skip` of them the next one compares as ever.
+                    let state = &mut unchanged.as_mut().unwrap()[page - base];
+                    if state.0 >= 2 && state.1 < skip {
+                        state.1 += 1;
+                        SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+                        passed = true;
+                        // Cut where pages taken before meet pages passed
+                        // over.
+                        if let Some((first, known)) = run.take() {
+                            runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                        }
+                        continue;
+                    }
+                }
+                if whole {
                     *at = now;
                 }
                 // Cut where pages taken before meet pages never taken.
@@ -4200,13 +4452,14 @@ impl Shadow {
                 runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
             }
         }
+        drop(unchanged);
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
-        if crate::watch::light() {
+        if crate::watch::light() && !passed {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
             ranged[0] = (from, to, now);
@@ -4343,6 +4596,11 @@ impl Shadow {
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
+        // Per page taken whole: whether the compare found the title's bytes
+        // unchanged ([`refresh_skip`]). Put in together after the pages, so
+        // that [`Shadow::copy_stale`] may hold the lock while it builds its
+        // runs.
+        let mut counts: Vec<(usize, bool)> = Vec::new();
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
             let mut at = from;
@@ -4358,6 +4616,9 @@ impl Shadow {
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
                 let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                if known && n == PAGE && self.skip.load(Ordering::Relaxed) != 0 {
+                    counts.push((at / PAGE - start / PAGE, runs.is_empty()));
+                }
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -4375,7 +4636,36 @@ impl Shadow {
                 at += n;
             }
         });
+        if !counts.is_empty() {
+            self.count_unchanged(counts);
+        }
         to - from
+    }
+
+    /// [`refresh_skip`]'s counts of `counts` (page, whether the compare
+    /// found the title's bytes unchanged) put in: one more compare in a row
+    /// that found nothing to copy, or the counts forgotten where it found a
+    /// change. `SKIPPED` counts the compares that ended a run of passed-over
+    /// rounds, by what they found.
+    fn count_unchanged(&self, counts: Vec<(usize, bool)>) {
+        let mut unchanged = self.unchanged.lock().unwrap_or_else(|e| e.into_inner());
+        for (page, same) in counts {
+            let Some(state) = unchanged.get_mut(page) else {
+                continue;
+            };
+            let ended = std::mem::replace(&mut state.1, 0) != 0;
+            if same {
+                state.0 = state.0.saturating_add(1);
+                if ended {
+                    SKIPPED[2].fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                *state = (0, 0);
+                if ended {
+                    SKIPPED[1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
@@ -4414,6 +4704,12 @@ impl Shadow {
         thread_local! {
             static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        // [`refresh_skip`]'s counts, for the 4 KiB pieces that lie in a page
+        // whole ([`Shadow::copy_stale`] passes pages over; a piece of a page
+        // says nothing of it whole). A page counts as unchanged only if
+        // every piece of it in this compare did.
+        let counting = self.skip.load(Ordering::Relaxed) != 0;
+        let mut counts: Vec<(usize, bool)> = Vec::new();
         SCRATCH.with(|s| {
             let mut title = s.borrow_mut();
             // Keep the buffer's length: every byte is overwritten below, and
@@ -4430,6 +4726,18 @@ impl Shadow {
             while at <= title.len() {
                 let end = (at + PIECE).min(title.len());
                 let differs = at < title.len() && title[at..end] != held[at..end];
+                if counting && end - at == PIECE && (from + at) % PIECE == 0 {
+                    // Only a page the compare took whole counts: the passing
+                    // over is of whole pages ([`Shadow::copy_stale`]).
+                    let page_at = (from + at) / PAGE * PAGE;
+                    if page_at >= from && page_at + PAGE <= to {
+                        let page = page_at / PAGE - start / PAGE;
+                        match counts.last_mut() {
+                            Some(last) if last.0 == page => last.1 &= !differs,
+                            _ => counts.push((page, !differs)),
+                        }
+                    }
+                }
                 if differs {
                     run.get_or_insert(at);
                 } else if let Some(first) = run.take() {
@@ -4445,6 +4753,9 @@ impl Shadow {
             }
             COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
             COPY_COMPARED[1].fetch_add((to - from - changed) as u64, Ordering::Relaxed);
+            if counting {
+                self.count_unchanged(std::mem::take(&mut counts));
+            }
             changed
         })
     }
@@ -4521,6 +4832,10 @@ impl Shadow {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
         }
         self.changed(from, to);
+        // The title's bytes at these pages were put in and the same sent to
+        // the copy: whatever a compare found before says nothing
+        // ([`refresh_skip`]).
+        self.forget(address, bytes.len());
     }
 
     /// Of a copy in the card's memory: where its CPU side is.
@@ -4866,6 +5181,11 @@ impl Shadow {
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
+                // What the card wrote went into title memory at these pages
+                // ([`refresh_skip`]): whatever a compare found before says
+                // nothing.
+                let base = self.start as usize / PAGE;
+                self.forget_each(lo / PAGE + base..=(hi - 1) / PAGE + base);
             }
             put += merged;
         }
@@ -4895,7 +5215,14 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        let put = unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) };
+        if put > 0 {
+            // What the card wrote went into title memory at these pages
+            // ([`refresh_skip`]): whatever a compare found before says
+            // nothing.
+            self.forget(self.start as usize + at, n);
+        }
+        put
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
@@ -6004,6 +6331,71 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) fn copy_compare() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1"))
+}
+
+/// How many rounds of refreshes in a row a page the write watch keeps
+/// reporting may be passed over unread and uncompared
+/// (`VICTORY_REFRESH_SKIP=<n>`; 0: never, at most 3). [`SKIP`] holds it, so
+/// that a copy of a test's own can have another.
+///
+/// The honest failure mode, for the rounds passed over: the write watch says
+/// that a page was written, not what. Two compares in a row found the
+/// written page unchanged, and from that the page is believed to keep
+/// holding the copy's bytes. What that belief misses, until the round after
+/// the last passed-over one compares again:
+///
+/// - the title writing a *different* value into the page (after writing the
+///   same one twice, say). The copy — and what the card reads — hold the
+///   older bytes for at most `n` rounds;
+/// - pages arriving (a streamed-in texture's mips) or the runtime changing
+///   what title memory shows: nothing tells of either.
+///
+/// So the bound is small on purpose. Whatever compares find, shader writes
+/// or fetches declared for the page ([`Shadow::writing`]), bytes put into
+/// title memory at it ([`Shadow::placed_copy`], what the card's lands), a
+/// compare that finds a change, and a change of mapping all end the
+/// counting, and `n` of 0 is exactly as without any of this.
+pub(crate) fn refresh_skip() -> u8 {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let n = std::env::var("VICTORY_REFRESH_SKIP").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(0).min(3);
+        SKIP.store(n, Ordering::Relaxed);
+        tracing::info!(
+            n,
+            "VICTORY_REFRESH_SKIP={n}: a page the write watch keeps reporting, whose last two refreshes \
+             found nothing to copy, is passed over unread for at most {n} refreshes in a row (0: never)"
+        );
+    });
+    SKIP.load(Ordering::Relaxed)
+}
+
+/// [`refresh_skip`]'s state, read once from the environment.
+static SKIP: AtomicU8 = AtomicU8::new(0);
+
+/// Since the last frame-rate line, with [`refresh_skip`]: pages of refreshes
+/// passed over unread, compares after them that found the title's bytes
+/// changed, and such that found them unchanged.
+pub(crate) static SKIPPED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`SKIPPED`] against the frames of the last second, with
+/// [`refresh_skip`] on.
+pub(crate) fn skip_line(frames: f64) {
+    let n = SKIP.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    let [passed, changed, same] = [0, 1, 2].map(|i| SKIPPED[i].swap(0, Ordering::Relaxed));
+    if passed == 0 && changed == 0 && same == 0 {
+        return;
+    }
+    let per = |n: u64| n as f64 / frames.max(1.0);
+    tracing::info!(
+        "refreshes passed over per frame (VICTORY_REFRESH_SKIP={n}): {:.0} pages unread, and of the compares \
+         that ended a run of them {:.0} found the title's bytes changed, {:.0} unchanged",
+        per(passed),
+        per(changed),
+        per(same)
+    );
 }
 
 /// Since the last frame-rate line, with [`copy_compare`]: bytes the title
