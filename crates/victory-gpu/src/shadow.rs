@@ -1763,7 +1763,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
-                    if now != old {
+                    if differing(now, old) {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -2047,6 +2047,200 @@ struct Compared(std::time::Instant);
 impl Drop for Compared {
     fn drop(&mut self) {
         under_ns(6, self.0);
+    }
+}
+
+/// Whether the pieces the host compares ([`differing`]) are compared wide,
+/// 32 bytes at a time on AVX2 (`VICTORY_COMPARE_WIDE=1`; off by default,
+/// when the compares are the slices' own, as they were). The finders of the
+/// pieces that differ ([`Shadow::copy_compared`], [`Shadow::differing`],
+/// [`find_pieces`]) ask of a piece only whether any byte of it differs; the
+/// wide compare answers no more and no less.
+fn compare_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMPARE_WIDE").is_some_and(|v| v == "1");
+        tracing::info!("comparing pages wide (VICTORY_COMPARE_WIDE): {}", if on { "on" } else { "off" });
+        on
+    })
+}
+
+/// Whether any byte of `from` differs from the byte at the same place of
+/// `to` (the two of one length): what the piece compares ask. Wide when
+/// [`compare_wide`] says so, else the slices' own compare.
+fn differing(from: &[u8], to: &[u8]) -> bool {
+    if from.len() != to.len() {
+        return from != to;
+    }
+    if !compare_wide() {
+        return from != to;
+    }
+    wide_differing(from, to)
+}
+
+/// [`differing`]'s wide compare, however the processor has it: AVX2, 32
+/// bytes at a time, on x86_64, whole `u64` words elsewhere.
+fn wide_differing(from: &[u8], to: &[u8]) -> bool {
+    debug_assert_eq!(from.len(), to.len());
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2, and the slices are of one length.
+        return unsafe { differing_avx2(from, to) };
+    }
+    differing_words(from, to)
+}
+
+/// [`wide_differing`] without AVX2: whole `u64` words while they last, then
+/// the slices' own compare of what is left. The words are gathered byte by
+/// byte, so unaligned slices are none of it.
+fn differing_words(from: &[u8], to: &[u8]) -> bool {
+    let n = from.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        if u64::from_le_bytes(from[i..i + 8].try_into().unwrap()) != u64::from_le_bytes(to[i..i + 8].try_into().unwrap()) {
+            return true;
+        }
+        i += 8;
+    }
+    from[i..] != to[i..]
+}
+
+/// # Safety
+/// AVX2, and two slices of one length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn differing_avx2(from: &[u8], to: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    let n = from.len();
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: inside both slices (`i + 32 <= n`); the loads are unaligned.
+        let same = unsafe {
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(
+                _mm256_loadu_si256(from.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(to.as_ptr().add(i).cast()),
+            ))
+        };
+        if same != -1 {
+            return true;
+        }
+        i += 32;
+    }
+    differing_words(&from[i..], &to[i..])
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::{differing, differing_words, wide_differing};
+
+    /// The page of `len` bytes whose byte `at` is changed, beside what it
+    /// was: `(changed, what it was)` for `at < len`, else `(false, _)` twice.
+    fn page(len: usize, at: usize) -> (Vec<u8>, Vec<u8>) {
+        let a: Vec<u8> = (0..len as u64).map(|i| (i * 7 + 3) as u8).collect();
+        let mut b = a.clone();
+        let changed = at < len;
+        if changed {
+            b[at] ^= 0x5a;
+        }
+        (a, b)
+    }
+
+    /// Every compare of two pages of one length agrees with the slices' own
+    /// compare, whether one byte differs or none.
+    fn all_agree(len: usize, at: usize) {
+        let (a, b) = page(len, at);
+        assert_eq!(differing_words(&a, &b), a != b, "words, len {len} at {at}");
+        assert_eq!(wide_differing(&a, &b), a != b, "wide, len {len} at {at}");
+        assert_eq!(differing(&a, &b), a != b, "chosen, len {len} at {at}");
+    }
+
+    /// Two identical pages differ not.
+    #[test]
+    fn identical_pages_differ_not() {
+        for len in [0, 1, 8, 31, 32, 4096, 8192] {
+            all_agree(len, usize::MAX);
+        }
+    }
+
+    /// A difference in the first byte, the last byte, or the middle of any
+    /// 32-byte block is found, and only that.
+    #[test]
+    fn one_differing_byte_is_found_wherever_it_lies() {
+        let len = 4096;
+        for at in [0, 1, 7, 15, 16, 17, 31, 32, 37 * 32 + 16, len / 2, len - 1] {
+            all_agree(len, at);
+        }
+    }
+
+    /// A page where the middle of every 32-byte block differs is found.
+    #[test]
+    fn every_block_differing_is_found() {
+        let (a, mut b): (Vec<u8>, Vec<u8>) =
+            ((0..4096u64).map(|i| i as u8).collect(), (0..4096u64).map(|i| i as u8).collect());
+        for k in 0..4096 / 32 {
+            b[k * 32 + 16] ^= 0x5a;
+        }
+        assert!(a != b);
+        assert!(differing_words(&a, &b));
+        assert!(wide_differing(&a, &b));
+        assert!(differing(&a, &b));
+        let same = a.clone();
+        assert!(!differing_words(&a, &same) && !wide_differing(&a, &same) && !differing(&a, &same));
+    }
+
+    /// Odd lengths: first, last and middle byte, and nothing changed.
+    #[test]
+    fn odd_lengths_agree_with_the_slices_own_compare() {
+        for len in [1, 2, 3, 7, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 4095, 4097, 8191] {
+            for at in [0, len / 2, len - 1] {
+                all_agree(len, at);
+            }
+        }
+    }
+
+    /// Slices cut out of a page at odd offsets (no 32-byte line holds both
+    /// ends whole) are compared right.
+    #[test]
+    fn unaligned_slices_agree_with_the_slices_own_compare() {
+        for off in [1, 3, 7, 11, 29, 33, 47, 63] {
+            let (a, b) = page(4096 + 64, usize::MAX);
+            let (a, b) = (&a[off..off + 4096], &b[off..off + 4096]);
+            assert!(!differing_words(a, b) && !wide_differing(a, b) && !differing(a, b), "same at offset {off}");
+            let (a, b) = page(4096 + 64, off + 2048);
+            let (a, b) = (&a[off..off + 4096], &b[off..off + 4096]);
+            assert!(a != b);
+            assert!(differing_words(a, b) && wide_differing(a, b) && differing(a, b), "changed at offset {off}");
+        }
+    }
+
+    /// Whole words and the AVX2 blocks at every length up to a few: the
+    /// compares agree with the slices' own.
+    #[test]
+    fn short_lengths_agree_with_the_slices_own_compare() {
+        for len in 0..=300usize {
+            for at in [0, 7, 8, 15, 16, 17, 31, 32, 33, len / 2, len.saturating_sub(1)] {
+                all_agree(len, at);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// The AVX2 compare itself, where the processor has it.
+    #[test]
+    fn avx2_agrees_with_the_slices_own_compare() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let compare = |a: &[u8], b: &[u8]| {
+            // SAFETY: the processor has AVX2, and the slices are of one length.
+            unsafe { super::differing_avx2(a, b) }
+        };
+        for len in [0, 1, 31, 32, 33, 63, 64, 65, 4095, 4096, 4097] {
+            for at in [0, len / 2, len.saturating_sub(1)] {
+                let (a, b) = page(len, at);
+                assert_eq!(compare(&a, &b), a != b, "len {len} at {at}");
+            }
+        }
     }
 }
 
@@ -3568,7 +3762,7 @@ impl Shadow {
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
                 let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                if differing(host, &before[at - from..at - from + n]) {
                     found.push((at, n));
                 }
                 at += n;
@@ -4429,7 +4623,7 @@ impl Shadow {
             let mut at = 0;
             while at <= title.len() {
                 let end = (at + PIECE).min(title.len());
-                let differs = at < title.len() && title[at..end] != held[at..end];
+                let differs = at < title.len() && differing(&title[at..end], &held[at..end]);
                 if differs {
                     run.get_or_insert(at);
                 } else if let Some(first) = run.take() {
